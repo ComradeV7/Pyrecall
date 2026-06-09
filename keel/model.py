@@ -1,0 +1,487 @@
+"""Model — wraps a HuggingFace causal LM with continuous fine-tuning capabilities."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    Trainer,
+    TrainingArguments,
+)
+
+from .benchmarks.default import DEFAULT_BENCHMARKS
+from .detector import ForgettingDetector, ForgettingReport
+from .rollback import RollbackManager
+from .snapshot import SkillScore, SkillSnapshot
+from .utils import compute_embeddings, console, cosine_similarity, get_logger, safe_model_name
+
+logger = get_logger(__name__)
+
+# ── LoRA target-module heuristics ─────────────────────────────────────────────
+# Maps a substring of the model name (lowercase) to the attention projection layers
+# that LoRA should adapt. The "default" key is the fallback.
+_LORA_TARGETS: dict[str, list[str]] = {
+    "llama": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    "mistral": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    "qwen": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    "gemma": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    "falcon": ["query_key_value"],
+    "mpt": ["Wqkv"],
+    "bloom": ["query_key_value"],
+    "gpt2": ["c_attn", "c_proj"],
+    "gpt-neo": ["q_proj", "v_proj"],
+    "gpt-j": ["q_proj", "v_proj"],
+    "opt": ["q_proj", "v_proj"],
+    "default": ["q_proj", "v_proj"],
+}
+
+
+class KeelError(Exception):
+    """Raised for user-facing operational errors in keelfit."""
+
+
+class Model:
+    """
+    A HuggingFace causal LM wrapped for continuous fine-tuning.
+
+    Provides four lifecycle methods that mirror git's snapshot/commit/diff/reset:
+
+    * :meth:`snapshot`  — record current capabilities before training.
+    * :meth:`learn`     — fine-tune on new data using LoRA.
+    * :meth:`check`     — compare capabilities before and after to detect forgetting.
+    * :meth:`rollback`  — restore a previous snapshot's adapter weights.
+
+    Example::
+
+        model = Model("meta-llama/Llama-3.2-1B", strategy="lora")
+        model.snapshot(name="before_v1")
+        model.learn("data.jsonl", epochs=3)
+        report = model.check()
+        if not report.is_healthy:
+            model.rollback(to="before_v1")
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        strategy: str = "lora",
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.1,
+        device: Optional[str] = None,
+        snapshot_dir: Optional[Path] = None,
+        forgetting_threshold: float = 0.10,
+    ) -> None:
+        """
+        Load *model_name* from HuggingFace Hub (or local cache) and wrap it with LoRA.
+
+        Args:
+            model_name: HuggingFace model identifier, e.g. ``"meta-llama/Llama-3.2-1B"``.
+            strategy: Fine-tuning strategy. Only ``"lora"`` is supported.
+            lora_r: LoRA rank (lower = fewer parameters, higher = more capacity).
+            lora_alpha: LoRA scaling factor (usually 2× rank).
+            lora_dropout: Dropout applied to LoRA layers.
+            device: ``"cuda"``, ``"cpu"``, or ``"mps"``. Auto-detected when None.
+            snapshot_dir: Override the default ``~/.keel/snapshots/<model>`` path.
+            forgetting_threshold: Score drop fraction that counts as forgetting (0–1).
+        """
+        if strategy != "lora":
+            raise KeelError(
+                f"Unknown strategy '{strategy}'. "
+                "keelfit currently supports only strategy='lora'. "
+                "Example: Model('meta-llama/Llama-3.2-1B', strategy='lora')"
+            )
+
+        self.model_name = model_name
+        self.strategy = strategy
+        self.device = device or self._best_device()
+
+        self._baseline_snapshot_name: Optional[str] = None
+
+        console.print(f"[info]Loading {model_name} on {self.device}…[/info]")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        dtype = torch.float16 if self.device != "cpu" else torch.float32
+        base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+
+        target_modules = self._lora_targets(model_name)
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        self.model: PeftModel = get_peft_model(base, lora_cfg)
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        self.rollback_manager = RollbackManager(
+            model_name=model_name, base_dir=snapshot_dir
+        )
+        self.detector = ForgettingDetector(threshold=forgetting_threshold)
+
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in self.model.parameters())
+        console.print(
+            f"[success]✓ Model ready. "
+            f"{n_trainable:,} / {n_total:,} parameters are trainable "
+            f"({n_trainable / n_total:.2%}).[/success]"
+        )
+
+    # ── public API ─────────────────────────────────────────────────────────────
+
+    def snapshot(self, name: str) -> SkillSnapshot:
+        """
+        Benchmark the model and save a named capability snapshot.
+
+        Runs all 20 default benchmarks, scores each response, saves the scores
+        *and* the current LoRA adapter weights to disk so the model can be
+        rolled back to this exact state later.
+
+        Args:
+            name: A human-readable label for this snapshot, e.g. ``"before_v1"``.
+
+        Returns:
+            The :class:`~keel.snapshot.SkillSnapshot` that was saved.
+        """
+        console.print(f"[info]Taking snapshot '{name}'…[/info]")
+
+        scores = self._run_benchmarks()
+        snap = SkillSnapshot(name=name, model_name=self.model_name, scores=scores)
+        self.rollback_manager.save(snap, self.model)
+
+        self._baseline_snapshot_name = name
+
+        console.print(
+            f"[success]✓ Snapshot '{name}' saved. "
+            f"Overall score: {snap.overall_score():.3f}[/success]"
+        )
+        return snap
+
+    def learn(
+        self,
+        data_path: str,
+        epochs: int = 3,
+        batch_size: int = 4,
+        learning_rate: float = 2e-4,
+        max_length: int = 512,
+    ) -> None:
+        """
+        Fine-tune the model on *data_path* using LoRA.
+
+        *data_path* must be a JSONL file where each line is a JSON object with
+        a ``"text"`` key containing the training text.  Example line::
+
+            {"text": "### Human: What is 2+2?\\n\\n### Assistant: 4"}
+
+        Args:
+            data_path: Path to the training JSONL file.
+            epochs: Number of full passes over the training data.
+            batch_size: Per-device training batch size.
+            learning_rate: AdamW learning rate.
+            max_length: Tokenisation truncation length.
+        """
+        data_file = Path(data_path)
+        if not data_file.exists():
+            raise KeelError(
+                f"Training data not found at '{data_path}'. "
+                "Provide a valid JSONL file where each line has a 'text' key."
+            )
+
+        console.print(f"[info]Fine-tuning on '{data_path}' for {epochs} epoch(s)…[/info]")
+
+        dataset = load_dataset("json", data_files=str(data_file), split="train")
+
+        # Infer the text column — fall back to the first column if "text" is absent.
+        text_col = "text" if "text" in dataset.column_names else dataset.column_names[0]
+
+        def _tokenize(batch: dict[str, list]) -> dict:
+            return self.tokenizer(
+                batch[text_col],
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+            )
+
+        tokenized = dataset.map(_tokenize, batched=True, remove_columns=dataset.column_names)
+
+        run_dir = str(
+            Path.home() / ".keel" / "runs" / safe_model_name(self.model_name)
+        )
+
+        args = TrainingArguments(
+            output_dir=run_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            learning_rate=learning_rate,
+            logging_steps=max(1, len(tokenized) // (batch_size * 5)),
+            save_strategy="no",
+            report_to="none",
+            fp16=(self.device != "cpu"),
+            dataloader_drop_last=False,
+        )
+
+        collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
+
+        trainer = Trainer(
+            model=self.model,
+            args=args,
+            train_dataset=tokenized,
+            data_collator=collator,
+        )
+
+        self.model.train()
+        trainer.train()
+        self.model.eval()
+
+        console.print(f"[success]✓ Fine-tuning complete ({epochs} epoch(s)).[/success]")
+
+    def check(self) -> ForgettingReport:
+        """
+        Detect forgetting by benchmarking the current model and comparing to
+        the most recent snapshot.
+
+        Must be called after at least one :meth:`snapshot` call.
+
+        Returns:
+            A :class:`~keel.detector.ForgettingReport` with per-category scores
+            printed to the terminal automatically.
+        """
+        if not self._baseline_snapshot_name:
+            raise KeelError(
+                "No baseline snapshot found.\n"
+                "Call model.snapshot(name='before_v1') before fine-tuning, "
+                "then call model.check() afterwards."
+            )
+
+        before = self.rollback_manager.load_snapshot(self._baseline_snapshot_name)
+
+        console.print("[info]Running post-training benchmarks…[/info]")
+        after_scores = self._run_benchmarks()
+        after_name = f"{self._baseline_snapshot_name}__after"
+        after = SkillSnapshot(
+            name=after_name, model_name=self.model_name, scores=after_scores
+        )
+        after.save(self.rollback_manager.base_dir / after_name)
+
+        report = self.detector.compare(before, after)
+        report.print()
+        return report
+
+    def rollback(self, to: str) -> None:
+        """
+        Restore the model to the state captured in snapshot *to*.
+
+        Reloads the base model from disk/cache and applies the saved LoRA
+        adapter weights from the snapshot. This replaces the current in-memory
+        model, so any training done after the snapshot is discarded.
+
+        Args:
+            to: The name of a snapshot created with :meth:`snapshot`.
+        """
+        console.print(f"[info]Rolling back to snapshot '{to}'…[/info]")
+
+        snap = self.rollback_manager.load_snapshot(to)
+
+        if snap.adapter_path is None or not snap.adapter_path.exists():
+            raise KeelError(
+                f"Snapshot '{to}' has no saved adapter weights at "
+                f"'{snap.adapter_path}'. "
+                "Only snapshots taken with model.snapshot() can be used for rollback."
+            )
+
+        dtype = torch.float16 if self.device != "cpu" else torch.float32
+        base = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=dtype)
+        self.model = PeftModel.from_pretrained(base, str(snap.adapter_path))
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        self._baseline_snapshot_name = to
+        console.print(f"[success]✓ Rolled back to '{to}'.[/success]")
+
+    def generate(self, prompt: str, max_new_tokens: int = 200) -> str:
+        """
+        Run inference and return the model's response to *prompt*.
+
+        Args:
+            prompt: The input text.
+            max_new_tokens: Maximum number of tokens to generate.
+
+        Returns:
+            The generated text (only the new tokens, not the prompt itself).
+        """
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    def serve(self, port: int = 8000, live_learning: bool = False) -> None:
+        """
+        Start a FastAPI inference server.
+
+        Exposes two endpoints:
+
+        * ``POST /generate`` — accepts ``{"prompt": "...", "max_new_tokens": 200}``,
+          returns ``{"response": "...", "model": "<name>"}``.
+        * ``GET /health`` — returns server status and, when *live_learning* is
+          enabled, the count of pending training examples.
+
+        Args:
+            port: TCP port to bind.
+            live_learning: When True, every inference request is stored and the
+                model is fine-tuned automatically once 50 interactions accumulate.
+        """
+        import uvicorn
+        from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
+        from pydantic import BaseModel as _Base
+
+        app = FastAPI(
+            title="keelfit",
+            description=f"Serving {self.model_name}",
+            version="0.1.0",
+        )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        learner = None
+        if live_learning:
+            from .live import LiveLearner
+            learner = LiveLearner(self)
+            console.print(
+                "[info]Live learning enabled — interactions will be collected "
+                "for automatic fine-tuning.[/info]"
+            )
+
+        class GenerateRequest(_Base):
+            prompt: str
+            max_new_tokens: int = 200
+
+        class GenerateResponse(_Base):
+            response: str
+            model: str
+
+        @app.post("/generate", response_model=GenerateResponse)
+        async def _generate(req: GenerateRequest) -> GenerateResponse:
+            text = self.generate(req.prompt, req.max_new_tokens)
+            if learner:
+                learner.record(req.prompt, text)
+            return GenerateResponse(response=text, model=self.model_name)
+
+        @app.get("/health")
+        async def _health() -> dict[str, Any]:
+            info: dict[str, Any] = {
+                "status": "ok",
+                "model": self.model_name,
+                "device": self.device,
+                "baseline_snapshot": self._baseline_snapshot_name,
+            }
+            if learner:
+                info["pending_training_examples"] = learner.pending_count()
+                info["total_interactions"] = learner.total_count()
+            return info
+
+        console.print(f"[success]✓ Server starting on http://0.0.0.0:{port}[/success]")
+        console.print("[dim]  POST /generate   — run inference[/dim]")
+        console.print("[dim]  GET  /health     — server status[/dim]")
+
+        uvicorn.run(app, host="0.0.0.0", port=port)
+
+    # ── private helpers ────────────────────────────────────────────────────────
+
+    def _run_benchmarks(self) -> list[SkillScore]:
+        """Run all default benchmarks and return SkillScore objects."""
+        scores: list[SkillScore] = []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task(
+                "Running benchmarks…", total=len(DEFAULT_BENCHMARKS)
+            )
+
+            for bench in DEFAULT_BENCHMARKS:
+                progress.update(
+                    task,
+                    description=(
+                        f"[{bench.category}] {bench.prompt[:55].rstrip()}…"
+                    ),
+                )
+
+                response = self.generate(bench.prompt)
+                if not response.strip():
+                    response = "[no response]"
+
+                resp_emb = compute_embeddings(
+                    self.model, self.tokenizer, response, device=self.device
+                )
+                ref_emb = compute_embeddings(
+                    self.model, self.tokenizer, bench.reference_answer, device=self.device
+                )
+
+                # Shift cosine similarity from [-1, 1] → [0, 1]
+                raw_sim = cosine_similarity(resp_emb, ref_emb)
+                score = (raw_sim + 1.0) / 2.0
+
+                scores.append(
+                    SkillScore(
+                        category=bench.category,
+                        prompt=bench.prompt,
+                        response=response,
+                        score=score,
+                    )
+                )
+
+                progress.advance(task)
+
+        return scores
+
+    @staticmethod
+    def _best_device() -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    @staticmethod
+    def _lora_targets(model_name: str) -> list[str]:
+        name_lower = model_name.lower()
+        for key, modules in _LORA_TARGETS.items():
+            if key != "default" and key in name_lower:
+                return modules
+        return _LORA_TARGETS["default"]
