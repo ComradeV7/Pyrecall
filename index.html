@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Python framework for continuous fine-tuning with automatic forgetting detection and skill rollback.">
+  <meta property="og:title" content="pyrecall — keep your models balanced">
+  <meta property="og:description" content="Python framework for continuous fine-tuning with automatic forgetting detection and skill rollback.">
+  <meta property="og:type" content="website">
+  <title>pyrecall — keep your models balanced</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #0a0a0a;
+      --surface: #141414;
+      --surface-2: #1c1c1c;
+      --border: #2a2a2a;
+      --border-hover: #3a3a3a;
+      --text: #f0f0f0;
+      --text-muted: #888888;
+      --text-dim: #555555;
+      --accent: #4f9eff;
+      --accent-hover: #6aabff;
+      --code-bg: #111111;
+      --code-keyword: #4f9eff;
+      --code-string: #7ec8a0;
+      --code-comment: #555555;
+      --code-function: #c9a9ff;
+      --code-param: #f0c97a;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 16px;
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    /* ─── NAV ─────────────────────────────────────────────────────────────── */
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      width: 100%;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      height: 56px;
+      display: flex;
+      align-items: center;
+    }
+
+    .nav-inner {
+      width: 100%;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .nav-logo svg {
+      flex-shrink: 0;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      font-size: 14px;
+      color: var(--text-muted);
+      transition: color 150ms;
+    }
+
+    .nav-links a:hover {
+      color: var(--text);
+    }
+
+    .nav-copy {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 14px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 150ms, color 150ms;
+      background: none;
+    }
+
+    .nav-copy:hover {
+      border-color: var(--border-hover);
+      color: var(--text);
+    }
+
+    .nav-copy .copy-icon {
+      flex-shrink: 0;
+      color: var(--text-dim);
+      transition: color 150ms;
+    }
+
+    .nav-copy:hover .copy-icon {
+      color: var(--text-muted);
+    }
+
+    /* ─── LAYOUT ──────────────────────────────────────────────────────────── */
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+
+    section {
+      padding: 80px 0;
+    }
+
+    .section-label {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--text-dim);
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+
+    h2 {
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: -1px;
+      line-height: 1.15;
+      color: var(--text);
+      margin-bottom: 24px;
+    }
+
+    /* ─── HERO ────────────────────────────────────────────────────────────── */
+
+    .hero {
+      padding: 120px 0 100px;
+    }
+
+    .hero-eyebrow {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 12px;
+      color: var(--text-dim);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      margin-bottom: 28px;
+    }
+
+    .hero h1 {
+      font-size: 64px;
+      font-weight: 800;
+      letter-spacing: -2px;
+      line-height: 1.05;
+      color: var(--text);
+      margin-bottom: 28px;
+    }
+
+    .hero-sub {
+      font-size: 18px;
+      color: var(--text-muted);
+      line-height: 1.7;
+      max-width: 560px;
+      margin-bottom: 40px;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 32px;
+    }
+
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      background: var(--accent);
+      color: #0a0a0a;
+      font-size: 15px;
+      font-weight: 700;
+      padding: 12px 24px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      transition: background 150ms;
+      text-decoration: none;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      background: transparent;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 500;
+      padding: 12px 24px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 150ms, color 150ms;
+      text-decoration: none;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--border-hover);
+      color: var(--text);
+    }
+
+    .hero-terminal {
+      display: inline-flex;
+      align-items: center;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 20px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 14px;
+    }
+
+    .hero-terminal .prompt {
+      color: var(--text-dim);
+      margin-right: 4px;
+      user-select: none;
+    }
+
+    .hero-terminal .cmd {
+      color: var(--text);
+    }
+
+    /* ─── PROBLEM ─────────────────────────────────────────────────────────── */
+
+    .problem {
+      border-top: 1px solid var(--border);
+    }
+
+    .problem-body {
+      max-width: 640px;
+    }
+
+    .problem-body p {
+      color: var(--text-muted);
+      margin-bottom: 20px;
+    }
+
+    .problem-body p:last-child {
+      margin-bottom: 0;
+    }
+
+    .problem-body p strong {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    /* ─── HOW IT WORKS ────────────────────────────────────────────────────── */
+
+    .how {
+      border-top: 1px solid var(--border);
+    }
+
+    .cards-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 48px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 28px;
+      transition: border-color 150ms;
+    }
+
+    .card:hover {
+      border-color: var(--border-hover);
+    }
+
+    .card-icon {
+      color: var(--accent);
+      margin-bottom: 20px;
+    }
+
+    .card h3 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+      color: var(--text);
+      margin-bottom: 12px;
+    }
+
+    .card p {
+      font-size: 15px;
+      color: var(--text-muted);
+      line-height: 1.65;
+    }
+
+    /* ─── CODE EXAMPLE ────────────────────────────────────────────────────── */
+
+    .code-section {
+      border-top: 1px solid var(--border);
+    }
+
+    .code-block {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 28px 32px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.8;
+      overflow-x: auto;
+      margin-top: 48px;
+    }
+
+    .code-block pre {
+      margin: 0;
+      white-space: pre;
+    }
+
+    .kw   { color: var(--code-keyword); }
+    .str  { color: var(--code-string); }
+    .fn   { color: var(--code-function); }
+    .pm   { color: var(--code-param); }
+    .cm   { color: var(--code-comment); }
+    .tx   { color: var(--text); }
+    .dm   { color: var(--text-dim); }
+
+    /* ─── CLI ─────────────────────────────────────────────────────────────── */
+
+    .cli-section {
+      border-top: 1px solid var(--border);
+    }
+
+    .cli-block {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 28px 32px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.8;
+      margin-top: 48px;
+    }
+
+    .cli-line {
+      display: flex;
+      gap: 0;
+    }
+
+    .cli-line .prompt {
+      color: var(--text-dim);
+      margin-right: 8px;
+      user-select: none;
+      flex-shrink: 0;
+    }
+
+    .cli-line .cli-cmd {
+      color: var(--text);
+    }
+
+    .cli-line .cli-comment {
+      color: var(--code-comment);
+      margin-left: 8px;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 8px;
+      height: 14px;
+      background: var(--text-muted);
+      vertical-align: text-bottom;
+      margin-left: 2px;
+      animation: blink 1s step-end infinite;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .cursor {
+        animation: none;
+        opacity: 1;
+      }
+    }
+
+    /* ─── SKILLS ──────────────────────────────────────────────────────────── */
+
+    .skills-section {
+      border-top: 1px solid var(--border);
+    }
+
+    .cards-5 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 48px;
+    }
+
+    .cards-5 .card:nth-child(4),
+    .cards-5 .card:nth-child(5) {
+      /* Last two cards */
+    }
+
+    .skill-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 20px;
+      transition: border-color 150ms;
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+    }
+
+    .skill-card:hover {
+      border-color: var(--border-hover);
+    }
+
+    .skill-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      flex-shrink: 0;
+      margin-top: 6px;
+    }
+
+    .skill-card-content h3 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .skill-card-content p {
+      font-size: 14px;
+      color: var(--text-muted);
+      line-height: 1.55;
+    }
+
+    /* ─── FOOTER ──────────────────────────────────────────────────────────── */
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 48px 0;
+    }
+
+    .footer-inner {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+
+    .footer-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 32px;
+      margin-bottom: 40px;
+    }
+
+    .footer-brand .footer-logo {
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .footer-brand .footer-tagline {
+      font-size: 14px;
+      color: var(--text-dim);
+    }
+
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      list-style: none;
+    }
+
+    .footer-links a {
+      font-size: 14px;
+      color: var(--text-dim);
+      transition: color 150ms;
+    }
+
+    .footer-links a:hover {
+      color: var(--text-muted);
+    }
+
+    .footer-bottom {
+      font-size: 13px;
+      color: var(--text-dim);
+      border-top: 1px solid var(--border);
+      padding-top: 24px;
+    }
+
+    /* ─── RESPONSIVE ──────────────────────────────────────────────────────── */
+
+    @media (max-width: 768px) {
+      .nav-inner {
+        padding: 0 20px;
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      .container {
+        padding: 0 20px;
+      }
+
+      .hero {
+        padding: 72px 0 64px;
+      }
+
+      .hero h1 {
+        font-size: 40px;
+        letter-spacing: -1.5px;
+      }
+
+      .hero-sub {
+        font-size: 16px;
+      }
+
+      h2 {
+        font-size: 28px;
+        letter-spacing: -0.5px;
+      }
+
+      .cards-3 {
+        grid-template-columns: 1fr;
+      }
+
+      .cards-5 {
+        grid-template-columns: 1fr;
+      }
+
+      .footer-top {
+        flex-direction: column;
+        gap: 24px;
+      }
+
+      .code-block {
+        padding: 20px;
+        font-size: 13px;
+      }
+
+      .cli-block {
+        padding: 20px;
+        font-size: 13px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .hero-actions {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .btn-primary,
+      .btn-secondary {
+        width: 100%;
+        justify-content: center;
+      }
+    }
+
+    /* 5-card grid: last row centers the 2 remaining cards */
+    @media (min-width: 769px) {
+      .cards-5 {
+        grid-template-columns: repeat(3, 1fr);
+      }
+
+      .cards-5 .card:nth-child(4) {
+        grid-column: 1;
+      }
+
+      .cards-5-row2 {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+        margin-top: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ─── NAV ─────────────────────────────────────────────────────────────── -->
+
+  <nav>
+    <div class="nav-inner">
+      <a href="#" class="nav-logo">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+        </svg>
+        pyrecall
+      </a>
+
+      <ul class="nav-links">
+        <li><a href="#">Docs</a></li>
+        <li><a href="https://github.com/Arths17/Pyrecall" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+        <li><a href="https://pypi.org/project/pyrecall/" target="_blank" rel="noopener noreferrer">PyPI</a></li>
+      </ul>
+
+      <button class="nav-copy" id="navCopyBtn" aria-label="Copy install command">
+        pip install pyrecall
+        <svg class="copy-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+        </svg>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ─── HERO ─────────────────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="hero">
+      <p class="hero-eyebrow">Open source &middot; MIT License &middot; v0.1.0</p>
+      <h1>Keep your models balanced.</h1>
+      <p class="hero-sub">
+        Fine-tuning silently degrades what your model already knows.
+        pyrecall detects exactly what changed and lets you roll back
+        specific skills before bad weights reach production.
+      </p>
+      <div class="hero-actions">
+        <a href="https://github.com/Arths17/Pyrecall" target="_blank" rel="noopener noreferrer" class="btn-primary">View on GitHub</a>
+        <a href="https://pypi.org/project/pyrecall/" target="_blank" rel="noopener noreferrer" class="btn-secondary">PyPI Package</a>
+      </div>
+      <div class="hero-terminal">
+        <span class="prompt">$</span>
+        <span class="cmd">pip install pyrecall</span>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── THE PROBLEM ───────────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="problem">
+      <p class="section-label">The Problem</p>
+      <h2>Fine-tuning has a silent failure mode.</h2>
+      <div class="problem-body">
+        <p>
+          You take a model that's good at a lot of things. You fine-tune it on your data —
+          customer support tickets, legal documents, whatever. It gets noticeably better at
+          your task. You ship it.
+        </p>
+        <p>
+          Six weeks later something feels off. The model handles your task fine but
+          everything else is worse. Reasoning is shakier. Code quality dropped. It's less
+          careful about safety cases it used to handle cleanly. <strong>Your loss curve
+          looked fine the whole time.</strong>
+        </p>
+        <p>
+          This is catastrophic forgetting. It's well documented in research and almost
+          completely ignored by tooling. There's no alarm. Nothing in your training loop
+          catches it. pyrecall does.
+        </p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── HOW IT WORKS ──────────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="how">
+      <p class="section-label">How It Works</p>
+      <h2>Snapshot. Detect. Rollback.</h2>
+
+      <div class="cards-3">
+        <div class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
+          </div>
+          <h3>Snapshot</h3>
+          <p>Before training, pyrecall runs your model through 20 benchmark prompts
+          across 5 skill categories and saves the scores. That's your baseline.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+          </div>
+          <h3>Detect</h3>
+          <p>After training, the same benchmarks run again. Any skill that dropped
+          beyond your threshold gets flagged. The report prints to your terminal
+          in color — green held, red degraded.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="1 4 1 10 7 10"/>
+              <path d="M3.51 15a9 9 0 1 0 .49-4.08"/>
+            </svg>
+          </div>
+          <h3>Rollback</h3>
+          <p>Every training run saves a LoRA adapter checkpoint. Roll back to any
+          named snapshot instantly. Not the whole model — just the adapter weights
+          that drifted.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── CODE EXAMPLE ──────────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="code-section">
+      <p class="section-label">The API</p>
+      <h2>Six lines. That's the whole workflow.</h2>
+
+      <div class="code-block">
+        <pre><span class="kw">from</span> <span class="tx">pyrecall</span> <span class="kw">import</span> <span class="fn">Model</span>
+
+<span class="tx">model</span> <span class="tx">=</span> <span class="fn">Model</span><span class="tx">(</span><span class="str">"meta-llama/Llama-3.2-1B"</span><span class="tx">,</span> <span class="pm">strategy</span><span class="tx">=</span><span class="str">"lora"</span><span class="tx">)</span>
+
+<span class="tx">model.</span><span class="fn">snapshot</span><span class="tx">(</span><span class="pm">name</span><span class="tx">=</span><span class="str">"before_v1"</span><span class="tx">)</span>   <span class="cm"># lock in current skill scores</span>
+<span class="tx">model.</span><span class="fn">learn</span><span class="tx">(</span><span class="str">"data.jsonl"</span><span class="tx">,</span> <span class="pm">epochs</span><span class="tx">=</span><span class="tx">3</span><span class="tx">)</span>  <span class="cm"># fine-tune on new data</span>
+<span class="tx">report</span> <span class="tx">=</span> <span class="tx">model.</span><span class="fn">check</span><span class="tx">()</span>              <span class="cm"># what got worse?</span>
+<span class="tx">model.</span><span class="fn">rollback</span><span class="tx">(</span><span class="pm">to</span><span class="tx">=</span><span class="str">"before_v1"</span><span class="tx">)</span>      <span class="cm"># fix it</span></pre>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── CLI ───────────────────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="cli-section">
+      <p class="section-label">The CLI</p>
+      <h2>Five commands. Everything you need.</h2>
+
+      <div class="cli-block">
+        <div class="cli-line">
+          <span class="prompt">$</span>
+          <span class="cli-cmd">pyrecall init</span>
+          <span class="cli-comment"># set up pyrecall in your project</span>
+        </div>
+        <div class="cli-line">
+          <span class="prompt">$</span>
+          <span class="cli-cmd">pyrecall snapshot v1</span>
+          <span class="cli-comment"># save current skill scores</span>
+        </div>
+        <div class="cli-line">
+          <span class="prompt">$</span>
+          <span class="cli-cmd">pyrecall check</span>
+          <span class="cli-comment"># detect forgetting since last snapshot</span>
+        </div>
+        <div class="cli-line">
+          <span class="prompt">$</span>
+          <span class="cli-cmd">pyrecall rollback v1</span>
+          <span class="cli-comment"># restore a previous snapshot</span>
+        </div>
+        <div class="cli-line">
+          <span class="prompt">$</span>
+          <span class="cli-cmd">pyrecall status</span>
+          <span class="cli-comment"># view all snapshots and scores</span>
+        </div>
+        <div class="cli-line" style="margin-top:4px;">
+          <span class="prompt" style="opacity:0">$</span>
+          <span class="cursor" aria-hidden="true"></span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── SKILL CATEGORIES ──────────────────────────────────────────────────── -->
+
+  <div class="container">
+    <section class="skills-section">
+      <p class="section-label">What Gets Tracked</p>
+      <h2>Five skill categories, benchmarked automatically.</h2>
+
+      <div class="cards-3" style="margin-bottom: 16px;">
+        <div class="skill-card">
+          <div class="skill-dot"></div>
+          <div class="skill-card-content">
+            <h3>Reasoning</h3>
+            <p>Multi-step logic and problem solving.</p>
+          </div>
+        </div>
+        <div class="skill-card">
+          <div class="skill-dot"></div>
+          <div class="skill-card-content">
+            <h3>Coding</h3>
+            <p>Code generation, debugging, explanation.</p>
+          </div>
+        </div>
+        <div class="skill-card">
+          <div class="skill-dot"></div>
+          <div class="skill-card-content">
+            <h3>Instruction Following</h3>
+            <p>Does it do what you asked?</p>
+          </div>
+        </div>
+      </div>
+      <div class="cards-5-row2">
+        <div class="skill-card">
+          <div class="skill-dot"></div>
+          <div class="skill-card-content">
+            <h3>General Knowledge</h3>
+            <p>Breadth of factual accuracy.</p>
+          </div>
+        </div>
+        <div class="skill-card">
+          <div class="skill-dot"></div>
+          <div class="skill-card-content">
+            <h3>Safety</h3>
+            <p>Handling sensitive and edge case prompts.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ─── FOOTER ────────────────────────────────────────────────────────────── -->
+
+  <footer>
+    <div class="footer-inner">
+      <div class="footer-top">
+        <div class="footer-brand">
+          <div class="footer-logo">pyrecall</div>
+          <div class="footer-tagline">keep your models balanced.</div>
+        </div>
+        <ul class="footer-links">
+          <li><a href="https://github.com/Arths17/Pyrecall" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+          <li><a href="https://pypi.org/project/pyrecall/" target="_blank" rel="noopener noreferrer">PyPI</a></li>
+          <li><a href="#">MIT License</a></li>
+        </ul>
+      </div>
+      <div class="footer-bottom">
+        &copy; 2026 &middot; Built by a developer, for developers.
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('navCopyBtn');
+      var originalHTML = btn.innerHTML;
+
+      btn.addEventListener('click', function () {
+        var text = 'pip install pyrecall';
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            showCopied();
+          }).catch(function () {
+            fallbackCopy(text);
+          });
+        } else {
+          fallbackCopy(text);
+        }
+      });
+
+      function showCopied() {
+        btn.textContent = 'Copied!';
+        btn.style.color = 'var(--accent)';
+        btn.style.borderColor = 'var(--accent)';
+        setTimeout(function () {
+          btn.innerHTML = originalHTML;
+          btn.style.color = '';
+          btn.style.borderColor = '';
+        }, 2000);
+      }
+
+      function fallbackCopy(text) {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          document.execCommand('copy');
+          showCopied();
+        } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    })();
+  </script>
+
+</body>
+</html>
