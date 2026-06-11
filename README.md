@@ -170,6 +170,15 @@ pyrecall rollback before_v1
 # See all snapshots and their per-category scores
 pyrecall status
 
+# Show score trends across all snapshots with coloured trend arrows
+pyrecall history
+
+# Limit to the 5 most recent snapshots
+pyrecall history --last 5
+
+# Focus on a single category
+pyrecall history --category coding
+
 # Inspect the replay buffer (fill level, capacity, total examples seen)
 pyrecall replay status
 

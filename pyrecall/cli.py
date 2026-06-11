@@ -538,6 +538,127 @@ def status() -> None:
         console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
 
 
+@app.command()
+def history(
+    category: Annotated[
+        Optional[str],
+        typer.Option("--category", "-c", help="Show trend for a single category only"),
+    ] = None,
+    last: Annotated[
+        int,
+        typer.Option("--last", "-n", help="Limit to the N most recent snapshots"),
+    ] = 0,
+) -> None:
+    """
+    Show per-category score trends across all snapshots.
+
+    Each row is a snapshot; columns show scores per skill with a coloured
+    trend arrow (↑ green = improved, ↓ red = dropped, → dim = unchanged).
+    Use --last N to focus on the most recent snapshots.
+    """
+    config = _read_config()
+    mgr = _build_rollback_manager(config)
+    all_snaps = mgr.list_snapshots()
+
+    if not all_snaps:
+        console.print(
+            "[yellow]No snapshots found.[/yellow] "
+            "Run [bold]pyrecall snapshot <name>[/bold] to create one."
+        )
+        return
+
+    if len(all_snaps) < 2:
+        console.print(
+            "[yellow]Only one snapshot found — need at least two to show trends.[/yellow]\n"
+            "Take another snapshot after training to see how scores change."
+        )
+        return
+
+    snaps = all_snaps[-last:] if last > 0 else all_snaps
+
+    # Determine which categories to show.
+    all_categories: list[str] = []
+    for snap in snaps:
+        for cat in snap.category_scores():
+            if cat not in all_categories:
+                all_categories.append(cat)
+
+    if category:
+        if category not in all_categories:
+            console.print(
+                f"[red]Error:[/red] Category '{category}' not found. "
+                f"Available: {all_categories}"
+            )
+            raise typer.Exit(1)
+        display_categories = [category]
+    else:
+        display_categories = all_categories
+
+    table = Table(
+        title=f"Score History — {config['model_name']}",
+        show_lines=True,
+    )
+    table.add_column("Snapshot", style="bold white", no_wrap=True)
+    table.add_column("Date", style="dim", no_wrap=True)
+    table.add_column("Overall", justify="right")
+    for cat in display_categories:
+        table.add_column(cat.replace("_", " ").title(), justify="right")
+
+    def _trend(prev: float, curr: float) -> str:
+        delta = curr - prev
+        if delta > 0.005:
+            return "[green]↑[/green]"
+        if delta < -0.005:
+            return "[red]↓[/red]"
+        return "[dim]→[/dim]"
+
+    baseline = config.get("baseline_snapshot")
+
+    for i, snap in enumerate(snaps):
+        cat_scores = snap.category_scores()
+        prev = snaps[i - 1].category_scores() if i > 0 else None
+        prev_overall = snaps[i - 1].overall_score() if i > 0 else None
+
+        overall_str = f"{snap.overall_score():.3f}"
+        if prev_overall is not None:
+            overall_str += f" {_trend(prev_overall, snap.overall_score())}"
+
+        name_markup = (
+            f"[bold green]{snap.name} ★[/bold green]"
+            if snap.name == baseline
+            else snap.name
+        )
+
+        row: list[str] = [
+            name_markup,
+            snap.created_at.strftime("%Y-%m-%d %H:%M"),
+            overall_str,
+        ]
+        for cat in display_categories:
+            score = cat_scores.get(cat, 0.0)
+            cell = f"{score:.3f}"
+            if prev is not None:
+                cell += f" {_trend(prev.get(cat, score), score)}"
+            row.append(cell)
+
+        table.add_row(*row)
+
+    console.print(table)
+
+    # Summary line: overall drift from first to last shown snapshot.
+    first_overall = snaps[0].overall_score()
+    last_overall = snaps[-1].overall_score()
+    delta = last_overall - first_overall
+    direction = "[green]improved[/green]" if delta > 0 else "[red]dropped[/red]" if delta < 0 else "unchanged"
+    console.print(
+        f"\n  Overall score {direction} by [bold]{abs(delta):.3f}[/bold] "
+        f"across {len(snaps)} snapshots "
+        f"({snaps[0].name} → {snaps[-1].name})."
+    )
+    if baseline:
+        console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
+
+
 # ── replay subcommands ─────────────────────────────────────────────────────────
 
 

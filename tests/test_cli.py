@@ -1018,3 +1018,126 @@ class TestStatus:
             runner.invoke(app, ["status"])
 
         mgr.list_snapshots.assert_called_once()
+
+
+# ── history ───────────────────────────────────────────────────────────────────
+
+
+class TestHistory:
+    def test_fails_without_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["history"])
+        assert result.exit_code == 1
+
+    def test_no_snapshots_message(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert result.exit_code == 0
+        assert "No snapshots" in result.output
+
+    def test_single_snapshot_prompts_for_more(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        mgr = _make_mock_manager(snapshots=[_make_snapshot("only")])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert result.exit_code == 0
+        assert "at least two" in result.output.lower() or "one snapshot" in result.output.lower()
+
+    def test_shows_snapshot_names(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snaps = [_make_snapshot("before"), _make_snapshot("after")]
+        mgr = _make_mock_manager(snapshots=snaps)
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert "before" in result.output
+        assert "after" in result.output
+
+    def test_shows_trend_arrows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("v1", {"coding": 0.90})
+        snap_b = _make_snapshot("v2", {"coding": 0.70})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert result.exit_code == 0
+        assert "↓" in result.output
+
+    def test_improvement_shows_up_arrow(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("v1", {"coding": 0.60})
+        snap_b = _make_snapshot("v2", {"coding": 0.90})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert "↑" in result.output
+
+    def test_category_filter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("v1", {"coding": 0.8, "reasoning": 0.7})
+        snap_b = _make_snapshot("v2", {"coding": 0.9, "reasoning": 0.6})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history", "--category", "coding"])
+        assert result.exit_code == 0
+        assert "coding" in result.output.lower() or "Coding" in result.output
+
+    def test_invalid_category_exits_one(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("v1", {"coding": 0.8})
+        snap_b = _make_snapshot("v2", {"coding": 0.9})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history", "--category", "nonexistent"])
+        assert result.exit_code == 1
+
+    def test_last_flag_limits_snapshots(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snaps = [_make_snapshot(f"v{i}", {"coding": 0.5 + i * 0.05}) for i in range(5)]
+        mgr = _make_mock_manager(snapshots=snaps)
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history", "--last", "2"])
+        assert result.exit_code == 0
+        assert "v3" in result.output
+        assert "v4" in result.output
+        assert "v0" not in result.output
+
+    def test_summary_line_shown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config(tmp_path)
+        snap_a = _make_snapshot("first", {"coding": 0.8})
+        snap_b = _make_snapshot("last", {"coding": 0.7})
+        mgr = _make_mock_manager(snapshots=[snap_a, snap_b])
+        with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
+            result = runner.invoke(app, ["history"])
+        assert "first" in result.output
+        assert "last" in result.output
