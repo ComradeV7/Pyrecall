@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyrecall"
-version = "0.2.0"
+version = "0.2.1"
 description = "Keep your models balanced. Continuous fine-tuning with automatic forgetting detection and skill rollback."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -55,8 +55,8 @@ dev = [
 pyrecall = "pyrecall.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/Arths17/Pyrecall"
-"Bug Tracker" = "https://github.com/Arths17/Pyrecall/issues"
+Homepage = "https://github.com/Pyrecall/Pyrecall"
+"Bug Tracker" = "https://github.com/Pyrecall/Pyrecall/issues"
 PyPI = "https://pypi.org/project/pyrecall"
 
 [tool.hatch.build.targets.wheel]
