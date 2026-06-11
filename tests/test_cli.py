@@ -1,4 +1,4 @@
-"""Tests for all CLI commands: init, learn, snapshot, check, rollback, status."""
+"""Tests for all CLI commands: init, learn, snapshot, check, rollback, status, replay."""
 
 from __future__ import annotations
 
@@ -700,6 +700,161 @@ class TestDelete:
         with patch("pyrecall.rollback.RollbackManager", return_value=mgr):
             result = runner.invoke(app, ["delete", "v1", "--yes"])
 
+        assert result.exit_code == 0
+
+
+# ── replay ─────────────────────────────────────────────────────────────────────
+
+
+def _write_config_with_replay(tmp_path: Path, replay_buffer_size: int = 500) -> None:
+    config = {
+        "model_name": "test/model",
+        "strategy": "lora",
+        "created_at": datetime.now().isoformat(),
+        "baseline_snapshot": None,
+        "replay_buffer_size": replay_buffer_size,
+    }
+    (tmp_path / _CONFIG_FILE).write_text(json.dumps(config, indent=2))
+
+
+class TestReplayStatus:
+    def test_fails_without_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["replay", "status"])
+        assert result.exit_code == 1
+
+    def test_disabled_message_when_buffer_size_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path, replay_buffer_size=0)
+        result = runner.invoke(app, ["replay", "status"])
+        assert result.exit_code == 0
+        assert "disabled" in result.output.lower()
+
+    def test_shows_model_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        from unittest.mock import MagicMock
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 42
+        mock_buf.total_seen = 100
+        mock_buf.max_size = 500
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "status"])
+        assert "test/model" in result.output
+
+    def test_shows_fill_level(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 250
+        mock_buf.total_seen = 300
+        mock_buf.max_size = 500
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "status"])
+        assert "250" in result.output
+        assert "500" in result.output
+
+    def test_empty_buffer_note(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 0
+        mock_buf.total_seen = 0
+        mock_buf.max_size = 500
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "status"])
+        assert result.exit_code == 0
+        assert "empty" in result.output.lower()
+
+    def test_exit_code_zero_on_success(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 10
+        mock_buf.total_seen = 10
+        mock_buf.max_size = 500
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "status"])
+        assert result.exit_code == 0
+
+
+class TestReplayClear:
+    def test_fails_without_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["replay", "clear", "--yes"])
+        assert result.exit_code == 1
+
+    def test_already_empty_skips_prompt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 0
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "clear", "--yes"])
+        mock_buf.clear.assert_not_called()
+        assert result.exit_code == 0
+
+    def test_clear_called_with_yes_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 50
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "clear", "--yes"])
+        mock_buf.clear.assert_called_once()
+        assert result.exit_code == 0
+
+    def test_aborted_without_yes_does_not_clear(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 50
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "clear"], input="n\n")
+        mock_buf.clear.assert_not_called()
+        assert result.exit_code == 0
+
+    def test_success_output_contains_model_name(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 20
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "clear", "--yes"])
+        assert "test/model" in result.output
+
+    def test_short_flag_y_skips_prompt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        _write_config_with_replay(tmp_path)
+        mock_buf = MagicMock()
+        mock_buf.__len__ = lambda self: 10
+        with patch("pyrecall.replay.ReplayBuffer", return_value=mock_buf):
+            result = runner.invoke(app, ["replay", "clear", "-y"])
+        mock_buf.clear.assert_called_once()
         assert result.exit_code == 0
 
     def test_success_output_contains_snapshot_name(

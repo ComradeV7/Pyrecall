@@ -19,7 +19,8 @@ app = typer.Typer(
         "  pyrecall init --model meta-llama/Llama-3.2-1B\n\n"
         "  # take a snapshot before training\n"
         "  pyrecall snapshot before_v1\n\n"
-        "  # ... run your training script ...\n\n"
+        "  # fine-tune on new data\n"
+        "  pyrecall learn train.jsonl --epochs 3 --snapshot-after after_v1\n\n"
         "  pyrecall status   # inspect all snapshots\n"
         "  pyrecall check    # compare last two snapshots\n"
         "  pyrecall rollback before_v1  # if forgetting is detected"
@@ -27,6 +28,14 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
 )
+
+replay_app = typer.Typer(
+    name="replay",
+    help="Inspect and manage the replay buffer.",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+app.add_typer(replay_app, name="replay")
 
 console = Console()
 
@@ -503,3 +512,69 @@ def status() -> None:
     console.print(table)
     if baseline:
         console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
+
+
+# ── replay subcommands ─────────────────────────────────────────────────────────
+
+
+@replay_app.command("status")
+def replay_status() -> None:
+    """Show the current state of the replay buffer for this project's model."""
+    config = _read_config()
+
+    from pyrecall.replay import ReplayBuffer
+
+    model_name = config["model_name"]
+    max_size = config.get("replay_buffer_size", 500)
+
+    if max_size == 0:
+        console.print("[yellow]Replay buffer is disabled[/yellow] (replay_buffer_size = 0).")
+        console.print("Re-run [bold]pyrecall init[/bold] with [bold]--replay-buffer-size > 0[/bold] to enable it.")
+        return
+
+    buf = ReplayBuffer(model_name, max_size=max_size)
+    filled = len(buf)
+    pct = filled / max_size * 100 if max_size else 0
+    bar_width = 30
+    filled_bars = int(bar_width * filled / max_size) if max_size else 0
+    bar = "█" * filled_bars + "░" * (bar_width - filled_bars)
+
+    console.print(f"\n  Model    [bold]{model_name}[/bold]")
+    console.print(f"  Buffer   [{bar}] {filled}/{max_size} ({pct:.0f}%)")
+    console.print(f"  Seen     {buf.total_seen} total examples added since creation\n")
+
+    if filled == 0:
+        console.print("[dim]  Buffer is empty — run pyrecall learn to populate it.[/dim]")
+
+
+@replay_app.command("clear")
+def replay_clear(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmation prompt"),
+    ] = False,
+) -> None:
+    """Permanently wipe the replay buffer for this project's model."""
+    config = _read_config()
+
+    from pyrecall.replay import ReplayBuffer
+
+    model_name = config["model_name"]
+    max_size = config.get("replay_buffer_size", 500)
+    buf = ReplayBuffer(model_name, max_size=max_size)
+
+    if len(buf) == 0:
+        console.print("[dim]Replay buffer is already empty.[/dim]")
+        return
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Permanently clear {len(buf)} examples from the replay buffer for '{model_name}'?",
+            default=False,
+        )
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(0)
+
+    buf.clear()
+    console.print(f"[green]✓ Replay buffer cleared[/green] for [bold]{model_name}[/bold].")
