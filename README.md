@@ -169,6 +169,13 @@ pyrecall rollback before_v1
 
 # See all snapshots and their per-category scores
 pyrecall status
+
+# Inspect the replay buffer (fill level, capacity, total examples seen)
+pyrecall replay status
+
+# Wipe the replay buffer (prompts for confirmation)
+pyrecall replay clear
+pyrecall replay clear --yes   # skip the prompt
 ```
 
 `pyrecall check` exits with **code 2** when forgetting is detected — drop it straight into your CI pipeline as a training gate.
