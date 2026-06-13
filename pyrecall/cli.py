@@ -1204,13 +1204,34 @@ def history(
         int,
         typer.Option("--last", "-n", help="Limit to the N most recent snapshots"),
     ] = 0,
+    health: Annotated[
+        bool,
+        typer.Option(
+            "--health",
+            help=(
+                "Show health status per snapshot instead of raw scores. "
+                "Each snapshot is compared to the previous one using the configured forgetting threshold."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output results as JSON instead of a rich table."),
+    ] = False,
 ) -> None:
     """
     Show per-category score trends across all snapshots.
 
-    Each row is a snapshot; columns show scores per skill with a coloured
-    trend arrow (↑ green = improved, ↓ red = dropped, → dim = unchanged).
-    Use --last N to focus on the most recent snapshots.
+    Default view: each row is a snapshot; columns show scores per skill with a
+    coloured trend arrow (↑ green = improved, ↓ red = dropped, → dim = unchanged).
+
+    Use --health for a condensed view that shows whether each snapshot introduced
+    forgetting versus the previous one, and which categories dropped.
+
+        pyrecall history
+        pyrecall history --health
+        pyrecall history --last 5 --health
+        pyrecall history --json
     """
     config = _read_config()
     mgr = _build_rollback_manager(config)
@@ -1231,6 +1252,101 @@ def history(
         return
 
     snaps = all_snaps[-last:] if last > 0 else all_snaps
+    baseline = config.get("baseline_snapshot")
+    threshold = config.get("forgetting_threshold", 0.10)
+
+    # ── health view ────────────────────────────────────────────────────────────
+    if health or json_output:
+        from pyrecall.detector import ForgettingDetector
+
+        detector = ForgettingDetector(
+            threshold=threshold,
+            category_thresholds=config.get("category_thresholds", {}),
+        )
+
+        health_rows: list[dict] = []
+        for i, snap in enumerate(snaps):
+            is_baseline = snap.name == baseline
+            if i == 0:
+                health_rows.append(
+                    {
+                        "name": snap.name,
+                        "created_at": snap.created_at.isoformat(),
+                        "overall": round(snap.overall_score(), 4),
+                        "status": "first",
+                        "degraded_skills": [],
+                        "notes": "(baseline)" if is_baseline else "(first snapshot)",
+                        "is_baseline": is_baseline,
+                    }
+                )
+            else:
+                report = detector.compare(snaps[i - 1], snap)
+                dropped_notes = [
+                    f"{c} {report.comparisons[[x.category for x in report.comparisons].index(c)].delta:+.3f}"
+                    for c in report.degraded_skills
+                ]
+                health_rows.append(
+                    {
+                        "name": snap.name,
+                        "created_at": snap.created_at.isoformat(),
+                        "overall": round(snap.overall_score(), 4),
+                        "status": "degraded" if report.degraded_skills else "healthy",
+                        "degraded_skills": report.degraded_skills,
+                        "notes": ", ".join(dropped_notes) if dropped_notes else "",
+                        "is_baseline": is_baseline,
+                    }
+                )
+
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "model": config["model_name"],
+                        "threshold": threshold,
+                        "snapshots": health_rows,
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        # Render health table.
+        table = Table(title=f"Snapshot Health Timeline — {config['model_name']}", show_lines=False)
+        table.add_column("Snapshot", style="bold white", no_wrap=True)
+        table.add_column("Created", style="dim", no_wrap=True)
+        table.add_column("Overall", justify="right")
+        table.add_column("Status", justify="center")
+        table.add_column("Notes", no_wrap=False)
+
+        for hr in health_rows:
+            name_str = (
+                f"[bold green]{hr['name']} ★[/bold green]" if hr["is_baseline"] else hr["name"]
+            )
+            if hr["status"] == "first":
+                status_str = "[dim]—[/dim]"
+            elif hr["status"] == "healthy":
+                status_str = "[green]✓ healthy[/green]"
+            else:
+                status_str = "[red]✗ DEGRADED[/red]"
+
+            notes = hr["notes"]
+            if hr["is_baseline"] and hr["status"] != "first":
+                notes = (notes + " ← baseline").strip() if notes else "← baseline"
+
+            table.add_row(
+                name_str,
+                hr["created_at"][:16].replace("T", " "),
+                f"{hr['overall']:.3f}",
+                status_str,
+                notes,
+            )
+
+        console.print(table)
+        if baseline:
+            console.print(f"[dim]  ★ = current baseline ({baseline})[/dim]")
+        return
+
+    # ── score trend view (default) ─────────────────────────────────────────────
 
     # Determine which categories to show.
     all_categories: list[str] = []
@@ -1266,8 +1382,6 @@ def history(
         if delta < -0.005:
             return "[red]↓[/red]"
         return "[dim]→[/dim]"
-
-    baseline = config.get("baseline_snapshot")
 
     for i, snap in enumerate(snaps):
         cat_scores = snap.category_scores()
@@ -1418,6 +1532,154 @@ def benchmark_remove(
         raise typer.Exit(1)
 
     console.print(f"[green]✓[/green] Removed benchmark suite [bold]{name}[/bold].")
+
+
+@benchmark_app.command("validate")
+def benchmark_validate(
+    name: Annotated[str, typer.Argument(help="Name of the custom suite to validate")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output results as JSON instead of formatted report."),
+    ] = False,
+) -> None:
+    """
+    Run static quality checks on a custom benchmark suite without loading a model.
+
+    Checks prompt length, reference answer length, duplicate prompts, category
+    balance, and reference answer variety. No inference is performed.
+
+        pyrecall benchmark validate my_suite
+        pyrecall benchmark validate my_suite --json
+
+    Exit code 0 if no errors (warnings are non-blocking); 1 if errors found.
+    """
+    from collections import Counter
+
+    from pyrecall.benchmarks.custom import CustomBenchmarkManager, _parse_jsonl
+
+    mgr = CustomBenchmarkManager()
+    suite_path = mgr.base_dir / f"{name}.jsonl"
+
+    if not suite_path.exists():
+        from pyrecall.benchmarks.default import CATEGORIES
+
+        if name in CATEGORIES:
+            console.print(
+                f"[dim]'{name}' is a built-in benchmark category — no validation needed.[/dim]"
+            )
+            return
+        available = [s["name"] for s in mgr.suites()]
+        console.print(
+            f"[red]Error:[/red] Suite '{name}' not found.\n"
+            f"Available: {available or ['(none registered)']}"
+        )
+        raise typer.Exit(1)
+
+    entries = _parse_jsonl(suite_path)
+    if not entries:
+        console.print(f"[red]Error:[/red] Suite '{name}' is empty or contains no valid entries.")
+        raise typer.Exit(1)
+
+    prompts = [e["prompt"] for e in entries]
+    refs = [e["reference_answer"] for e in entries]
+    cats = [e.get("category", name) for e in entries]
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    infos: list[str] = []
+
+    # ERROR: prompt too short (< 10 tokens by whitespace split)
+    for e in entries:
+        p = e["prompt"]
+        if len(p.split()) < 10:
+            errors.append(f'Prompt too short ({len(p.split())} tokens): "{p[:60]}"')
+
+    # ERROR: reference answer too short (< 3 tokens)
+    for e in entries:
+        r = e["reference_answer"]
+        if len(r.split()) < 3:
+            errors.append(
+                f'Reference answer too short ({len(r.split())} tokens): "{r}" '
+                f'(prompt: "{e["prompt"][:40]}")'
+            )
+
+    # ERROR: duplicate prompts within the suite
+    seen: set[str] = set()
+    for p in prompts:
+        if p in seen:
+            errors.append(f'Duplicate prompt: "{p[:60]}"')
+        seen.add(p)
+
+    # WARNING: any category with only 1 prompt (Cohen's d unavailable)
+    cat_counts = Counter(cats)
+    for cat, count in cat_counts.items():
+        if count == 1:
+            warnings.append(
+                f"Category '{cat}' has only 1 prompt — Cohen's d will not be computed for it."
+            )
+
+    # WARNING: all reference answers identical
+    if len(set(refs)) == 1:
+        warnings.append(
+            "All reference answers are identical — suite may not differentiate model quality."
+        )
+
+    # INFO: prompts not ending with a sentence-ending character
+    odd = [p for p in prompts if not p.rstrip().endswith(("?", ":", "."))]
+    if odd:
+        infos.append(
+            f"{len(odd)} prompt(s) don't end with '?', ':', or '.' — "
+            "verify they are complete sentences."
+        )
+
+    n_cats = len(cat_counts)
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "suite": name,
+                    "prompts": len(entries),
+                    "categories": n_cats,
+                    "errors": errors,
+                    "warnings": warnings,
+                    "info": infos,
+                    "valid": len(errors) == 0,
+                },
+                indent=2,
+            )
+        )
+    else:
+        cat_label = "categories" if n_cats != 1 else "category"
+        console.print(
+            f"\nValidating suite '[bold]{name}[/bold]' "
+            f"({len(entries)} prompt{'s' if len(entries) != 1 else ''} "
+            f"across {n_cats} {cat_label})…\n"
+        )
+        for msg in errors:
+            console.print(f"  [red]✗[/red]  {msg}")
+        for msg in warnings:
+            console.print(f"  [yellow]⚠[/yellow]  {msg}")
+        for msg in infos:
+            console.print(f"  [dim]ℹ[/dim]  {msg}")
+        if not errors and not warnings and not infos:
+            console.print("  [green]✓[/green]  All checks passed.")
+
+        parts = []
+        if errors:
+            parts.append(f"[red]{len(errors)} error{'s' if len(errors) != 1 else ''}[/red]")
+        if warnings:
+            parts.append(
+                f"[yellow]{len(warnings)} warning{'s' if len(warnings) != 1 else ''}[/yellow]"
+            )
+        if infos:
+            parts.append(f"[dim]{len(infos)} info[/dim]")
+        console.print(f"\nResult: {', '.join(parts) if parts else '[green]clean[/green]'}.")
+        if errors:
+            console.print("[dim]  Fix errors before using this suite in model.snapshot().[/dim]\n")
+
+    if errors:
+        raise typer.Exit(1)
 
 
 # ── replay subcommands ─────────────────────────────────────────────────────────
