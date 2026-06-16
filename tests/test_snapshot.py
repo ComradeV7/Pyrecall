@@ -55,7 +55,9 @@ class TestSkillScore:
         assert set(d) == {"category", "prompt", "response", "score", "scoring_method"}
 
     def test_from_dict_coerces_score_to_float(self) -> None:
-        s = SkillScore.from_dict({"category": "c", "prompt": "p", "response": "r", "score": "0.9"})
+        s = SkillScore.from_dict(
+            {"category": "c", "prompt": "p", "response": "r", "score": "0.9"}
+        )
         assert isinstance(s.score, float)
         assert s.score == 0.9
 
@@ -196,7 +198,9 @@ class TestSkillSnapshotPrivacy:
         except ImportError:
             pytest.skip("cryptography not installed")
 
-    def test_privacy_save_creates_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_creates_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         # Mock Path.home() to use tmp_path
         fake_home = tmp_path / "fake_home"
@@ -207,7 +211,9 @@ class TestSkillSnapshotPrivacy:
         snap.save(tmp_path / "v1", privacy=True)
         assert (tmp_path / "v1" / "snapshot.json").exists()
 
-    def test_privacy_save_sets_encrypted_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_sets_encrypted_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -218,7 +224,9 @@ class TestSkillSnapshotPrivacy:
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["encrypted"] is True
 
-    def test_privacy_save_does_not_store_key_in_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_does_not_store_key_in_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -229,7 +237,9 @@ class TestSkillSnapshotPrivacy:
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert "key" not in data
 
-    def test_privacy_save_creates_key_file_in_home_directory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_creates_key_file_in_home_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -242,7 +252,9 @@ class TestSkillSnapshotPrivacy:
         assert key_file.exists()
         assert key_file.is_file()
 
-    def test_privacy_save_key_file_has_correct_permissions(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_key_file_has_correct_permissions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -258,7 +270,9 @@ class TestSkillSnapshotPrivacy:
             file_mode = os.stat(key_file).st_mode & 0o777
             assert file_mode == 0o600
 
-    def test_privacy_save_encrypts_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_save_encrypts_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -269,7 +283,9 @@ class TestSkillSnapshotPrivacy:
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["name"] != "secret-snap"
 
-    def test_privacy_round_trip_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_round_trip_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -280,7 +296,9 @@ class TestSkillSnapshotPrivacy:
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.name == "secret-snap"
 
-    def test_privacy_round_trip_model_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_round_trip_model_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -291,7 +309,9 @@ class TestSkillSnapshotPrivacy:
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.model_name == "org/private-model"
 
-    def test_privacy_round_trip_scores(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_round_trip_scores(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -303,7 +323,9 @@ class TestSkillSnapshotPrivacy:
         assert len(loaded.scores) == 3
         assert loaded.scores[0].score == pytest.approx(snap.scores[0].score)
 
-    def test_privacy_round_trip_created_at(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_round_trip_created_at(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -314,7 +336,9 @@ class TestSkillSnapshotPrivacy:
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.created_at == _DT
 
-    def test_privacy_round_trip_sets_encrypted_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_round_trip_sets_encrypted_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -325,7 +349,9 @@ class TestSkillSnapshotPrivacy:
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.encrypted is True
 
-    def test_privacy_load_raises_when_key_file_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_privacy_load_raises_when_key_file_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -343,7 +369,9 @@ class TestSkillSnapshotPrivacy:
             SkillSnapshot.load(tmp_path / "v1", privacy=True)
 
     def test_privacy_save_without_cryptography_raises(self, tmp_path: Path) -> None:
-        with patch.dict("sys.modules", {"cryptography": None, "cryptography.fernet": None}):
+        with patch.dict(
+            "sys.modules", {"cryptography": None, "cryptography.fernet": None}
+        ):
             snap = _make_snapshot()
             with pytest.raises(ImportError, match="privacy"):
                 snap.save(tmp_path / "v1", privacy=True)
@@ -391,7 +419,9 @@ class TestEncryptor:
         assert isinstance(enc.key, bytes)
 
     def test_missing_cryptography_raises_import_error(self) -> None:
-        with patch.dict("sys.modules", {"cryptography": None, "cryptography.fernet": None}):
+        with patch.dict(
+            "sys.modules", {"cryptography": None, "cryptography.fernet": None}
+        ):
             import importlib
 
             import pyrecall.encrypt as enc_mod
@@ -404,9 +434,11 @@ class TestEncryptor:
 class TestOverallScoreCategoryBalanced:
     def test_overall_score_is_category_balanced(self) -> None:
         scores = [
-            SkillScore(category="math", prompt=f"p{i}", response="r", score=0.9) for i in range(10)
+            SkillScore(category="math", prompt=f"p{i}", response="r", score=0.9)
+            for i in range(10)
         ] + [
-            SkillScore(category="coding", prompt=f"q{i}", response="r", score=0.1) for i in range(2)
+            SkillScore(category="coding", prompt=f"q{i}", response="r", score=0.1)
+            for i in range(2)
         ]
         snap = SkillSnapshot(name="s", model_name="m", scores=scores)
         # category-balanced: (0.9 + 0.1) / 2 = 0.5, not prompt-weighted ~0.85
@@ -426,7 +458,8 @@ class TestOverallScoreCategoryBalanced:
 
     def test_overall_score_single_category(self) -> None:
         scores = [
-            SkillScore(category="coding", prompt=f"p{i}", response="r", score=0.8) for i in range(5)
+            SkillScore(category="coding", prompt=f"p{i}", response="r", score=0.8)
+            for i in range(5)
         ]
         snap = SkillSnapshot(name="s", model_name="m", scores=scores)
         assert abs(snap.overall_score() - 0.8) < 1e-9
@@ -480,7 +513,11 @@ class TestPrimaryScoringMethod:
     def test_returns_method_when_all_scores_agree(self) -> None:
         scores = [
             SkillScore(
-                category="c", prompt="p", response="r", score=0.5, scoring_method="log_likelihood"
+                category="c",
+                prompt="p",
+                response="r",
+                score=0.5,
+                scoring_method="log_likelihood",
             )
             for _ in range(5)
         ]
@@ -490,9 +527,21 @@ class TestPrimaryScoringMethod:
     def test_returns_majority_method_when_mixed(self) -> None:
         scores = [
             SkillScore(
-                category="c", prompt="p", response="r", score=0.5, scoring_method="log_likelihood"
+                category="c",
+                prompt="p",
+                response="r",
+                score=0.5,
+                scoring_method="log_likelihood",
             )
             for _ in range(9)
-        ] + [SkillScore(category="c", prompt="p", response="r", score=0.5, scoring_method="cosine")]
+        ] + [
+            SkillScore(
+                category="c",
+                prompt="p",
+                response="r",
+                score=0.5,
+                scoring_method="cosine",
+            )
+        ]
         snap = SkillSnapshot(name="s", model_name="m", scores=scores)
         assert snap.primary_scoring_method() == "log_likelihood"
