@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -88,9 +89,17 @@ class SkillSnapshot:
             from .encrypt import Encryptor
 
             encryptor = Encryptor()
+
+            # Store encryption key in centralized ~/.pyrecall/keys/ directory
+            # Use directory name (not internal snapshot name) for key file
+            key_dir = Path.home() / ".pyrecall" / "keys"
+            key_dir.mkdir(parents=True, exist_ok=True)
+            key_file = key_dir / f"{Path(directory).name}.key"
+            key_file.write_bytes(encryptor.key)
+            os.chmod(key_file, 0o600)  # Read/write for owner only
+
             data = {
                 "encrypted": True,
-                "key": encryptor.key.decode(),
                 "name": encryptor.encrypt(self.name),
                 "model_name": encryptor.encrypt(self.model_name),
                 "created_at": encryptor.encrypt(self.created_at.isoformat()),
@@ -119,7 +128,18 @@ class SkillSnapshot:
         if privacy:
             from .encrypt import Encryptor
 
-            encryptor = Encryptor(key=data["key"].encode())
+            # Load encryption key from centralized ~/.pyrecall/keys/ directory
+            # Use directory name (snapshot name) to locate the key file
+            key_file = Path.home() / ".pyrecall" / "keys" / f"{directory.name}.key"
+            if not key_file.exists():
+                raise FileNotFoundError(
+                    f"Decryption key not found at '{key_file}'. "
+                    f"The key for snapshot '{directory.name}' may have been deleted or moved."
+                )
+
+            key_bytes = key_file.read_bytes()
+            encryptor = Encryptor(key=key_bytes)
+
             return cls(
                 name=encryptor.decrypt(data["name"]),
                 model_name=encryptor.decrypt(data["model_name"]),

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -175,69 +177,151 @@ class TestSkillSnapshotPrivacy:
         except ImportError:
             pytest.skip("cryptography not installed")
 
-    def test_privacy_save_creates_file(self, tmp_path: Path) -> None:
+    def test_privacy_save_creates_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        # Mock Path.home() to use tmp_path
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot()
         snap.save(tmp_path / "v1", privacy=True)
         assert (tmp_path / "v1" / "snapshot.json").exists()
 
-    def test_privacy_save_sets_encrypted_true(self, tmp_path: Path) -> None:
+    def test_privacy_save_sets_encrypted_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot()
         snap.save(tmp_path / "v1", privacy=True)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["encrypted"] is True
 
-    def test_privacy_save_stores_key(self, tmp_path: Path) -> None:
+    def test_privacy_save_does_not_store_key_in_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot()
         snap.save(tmp_path / "v1", privacy=True)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
-        assert "key" in data
-        assert len(data["key"]) > 0
+        assert "key" not in data
 
-    def test_privacy_save_encrypts_name(self, tmp_path: Path) -> None:
+    def test_privacy_save_creates_key_file_in_home_directory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        snap = _make_snapshot(name="test-snapshot")
+        snap.save(tmp_path / "v1", privacy=True)
+
+        key_file = fake_home / ".pyrecall" / "keys" / "v1.key"
+        assert key_file.exists()
+        assert key_file.is_file()
+
+    def test_privacy_save_key_file_has_correct_permissions(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        snap = _make_snapshot(name="test-snapshot")
+        snap.save(tmp_path / "v1", privacy=True)
+
+        key_file = fake_home / ".pyrecall" / "keys" / "v1.key"
+        # Check that file has 0o600 permissions (owner read/write only)
+        # Windows doesn't support Unix permissions, so skip this check on Windows
+        if sys.platform != "win32":
+            file_mode = os.stat(key_file).st_mode & 0o777
+            assert file_mode == 0o600
+
+    def test_privacy_save_encrypts_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot(name="secret-snap")
         snap.save(tmp_path / "v1", privacy=True)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["name"] != "secret-snap"
 
-    def test_privacy_round_trip_name(self, tmp_path: Path) -> None:
+    def test_privacy_round_trip_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot(name="secret-snap")
         snap.save(tmp_path / "v1", privacy=True)
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.name == "secret-snap"
 
-    def test_privacy_round_trip_model_name(self, tmp_path: Path) -> None:
+    def test_privacy_round_trip_model_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot(model_name="org/private-model")
         snap.save(tmp_path / "v1", privacy=True)
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.model_name == "org/private-model"
 
-    def test_privacy_round_trip_scores(self, tmp_path: Path) -> None:
+    def test_privacy_round_trip_scores(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot(n_scores=3)
         snap.save(tmp_path / "v1", privacy=True)
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert len(loaded.scores) == 3
         assert loaded.scores[0].score == pytest.approx(snap.scores[0].score)
 
-    def test_privacy_round_trip_created_at(self, tmp_path: Path) -> None:
+    def test_privacy_round_trip_created_at(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot()
         snap.save(tmp_path / "v1", privacy=True)
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.created_at == _DT
 
-    def test_privacy_round_trip_sets_encrypted_flag(self, tmp_path: Path) -> None:
+    def test_privacy_round_trip_sets_encrypted_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
         snap = _make_snapshot()
         snap.save(tmp_path / "v1", privacy=True)
         loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
         assert loaded.encrypted is True
+
+    def test_privacy_load_raises_when_key_file_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._requires_cryptography()
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        snap = _make_snapshot()
+        snap.save(tmp_path / "v1", privacy=True)
+
+        # Delete the key file
+        key_file = fake_home / ".pyrecall" / "keys" / "v1.key"
+        key_file.unlink()
+
+        # Attempt to load should raise FileNotFoundError
+        with pytest.raises(FileNotFoundError, match="Decryption key not found"):
+            SkillSnapshot.load(tmp_path / "v1", privacy=True)
 
     def test_privacy_save_without_cryptography_raises(self, tmp_path: Path) -> None:
         with patch.dict("sys.modules", {"cryptography": None, "cryptography.fernet": None}):
