@@ -367,3 +367,291 @@ class TestLearnReplayIntegration:
             patched_model_with_replay.learn(str(data_file), epochs=1)
 
         assert len(concatenate_called_with) >= 2
+
+
+# ── Weighted replay tests ─────────────────────────────────────────────────────
+
+
+class TestReplayBufferCategories:
+    def test_add_stores_category_per_entry(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("test/model", max_size=10, base_dir=tmp_path)
+        buf.add(["text a", "text b"], categories=["coding", "safety"])
+        # sample returns text strings, so verify via persistence file
+        lines = (tmp_path / "test--model" / "buffer.jsonl").read_text().splitlines()
+        entries = [json.loads(line) for line in lines[1:] if line.strip()]
+        cats = {e["text"]: e["category"] for e in entries}
+        assert cats["text a"] == "coding"
+        assert cats["text b"] == "safety"
+
+    def test_add_without_categories_stores_none(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("test/model", max_size=10, base_dir=tmp_path)
+        buf.add(["hello"])
+        lines = (tmp_path / "test--model" / "buffer.jsonl").read_text().splitlines()
+        entry = json.loads(lines[1])
+        assert entry["category"] is None
+
+    def test_backward_compat_load_old_format(self, tmp_path: Path) -> None:
+        """Old buffer files without 'category' key load without error."""
+        from pyrecall.replay import ReplayBuffer
+
+        buf_path = tmp_path / "test--model" / "buffer.jsonl"
+        buf_path.parent.mkdir(parents=True)
+        buf_path.write_text(
+            json.dumps({"total_seen": 2, "max_size": 10})
+            + "\n"
+            + json.dumps({"text": "old entry"})
+            + "\n"
+        )
+
+        buf = ReplayBuffer("test/model", max_size=10, base_dir=tmp_path)
+        assert len(buf) == 1
+        assert buf.sample(1) == ["old entry"]
+
+    def test_weighted_sample_up_weights_category(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        random.seed(0)
+        buf = ReplayBuffer("test/model", max_size=200, base_dir=tmp_path)
+        buf.add([f"coding {i}" for i in range(50)], categories=["coding"] * 50)
+        buf.add([f"safety {i}" for i in range(50)], categories=["safety"] * 50)
+
+        # Up-weight coding 4× vs safety 1×
+        counts: dict[str, int] = {"coding": 0, "safety": 0}
+        for _ in range(50):
+            sample = buf.sample(20, weights={"coding": 4.0, "safety": 1.0})
+            for text in sample:
+                cat = text.split()[0]
+                counts[cat] += 1
+
+        # coding should appear more often than safety across all draws
+        assert counts["coding"] > counts["safety"]
+
+    def test_weighted_sample_falls_back_to_uniform_on_no_weights(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("test/model", max_size=10, base_dir=tmp_path)
+        buf.add(["a", "b", "c"])
+        result = buf.sample(3, weights=None)
+        assert set(result) == {"a", "b", "c"}
+
+    def test_learn_passes_categories_to_buffer(
+        self, patched_model_with_replay, tmp_path: Path
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from datasets import Dataset as HFDataset
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "train text", "category": "coding"}) + "\n")
+
+        real_ds = HFDataset.from_dict({"text": ["train text"], "category": ["coding"]})
+        mock_trainer = MagicMock()
+
+        add_calls: list = []
+        original_add = patched_model_with_replay.replay_buffer.add
+
+        def spy_add(examples, categories=None):
+            add_calls.append((examples, categories))
+            return original_add(examples, categories=categories)
+
+        patched_model_with_replay.replay_buffer.add = spy_add
+
+        with (
+            patch("pyrecall.model.load_dataset", return_value=real_ds),
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            patched_model_with_replay.tokenizer.side_effect = None
+            patched_model_with_replay.tokenizer.return_value = {
+                "input_ids": [1, 2],
+                "attention_mask": [1, 1],
+            }
+            patched_model_with_replay.learn(str(data_file), epochs=1)
+
+        assert add_calls, "add() was never called"
+        _, categories = add_calls[0]
+        assert categories is not None
+        assert "coding" in categories
+
+    def test_learn_replay_weights_from_report(
+        self, patched_model_with_replay, tmp_path: Path
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from datasets import Dataset as HFDataset
+
+        from pyrecall.detector import CategoryComparison, ForgettingReport
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+
+        patched_model_with_replay.replay_buffer.add(
+            [f"coding {i}" for i in range(10)], categories=["coding"] * 10
+        )
+
+        report = ForgettingReport(
+            snapshot_before="pre",
+            snapshot_after="post",
+            threshold=0.1,
+            comparisons=[
+                CategoryComparison(
+                    category="coding", score_before=0.8, score_after=0.3, cohen_d=-1.2
+                ),
+            ],
+        )
+
+        real_ds = HFDataset.from_dict({"text": ["hi"]})
+        mock_trainer = MagicMock()
+        sample_calls: list = []
+        original_sample = patched_model_with_replay.replay_buffer.sample
+
+        def spy_sample(n, weights=None):
+            sample_calls.append(weights)
+            return original_sample(n, weights=weights)
+
+        patched_model_with_replay.replay_buffer.sample = spy_sample
+
+        with (
+            patch("pyrecall.model.load_dataset", return_value=real_ds),
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            patched_model_with_replay.tokenizer.side_effect = None
+            patched_model_with_replay.tokenizer.return_value = {
+                "input_ids": [1, 2],
+                "attention_mask": [1, 1],
+            }
+            patched_model_with_replay.learn(str(data_file), replay_weights=report)
+
+        assert sample_calls, "sample() was never called"
+        weights_used = sample_calls[0]
+        assert weights_used is not None
+        assert weights_used.get("coding", 1.0) > 1.0
+
+
+class TestWeightedSampleEdgeCases:
+    """_weighted_sample_without_replacement must always return exactly k items."""
+
+    def test_all_zero_weights_returns_full_count(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["a", "b", "c", "d", "e"], categories=["coding"] * 5)
+        result = buf.sample(3, weights={"coding": 0.0})
+        assert len(result) == 3
+
+    def test_all_zero_weights_returns_strings(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["x", "y", "z"], categories=["coding"] * 3)
+        result = buf.sample(3, weights={"coding": 0.0})
+        assert all(isinstance(s, str) for s in result)
+        assert set(result) <= {"x", "y", "z"}
+
+    def test_mixed_weights_some_zero_returns_full_count(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["a", "b", "c"], categories=["coding", "safety", "coding"])
+        result = buf.sample(3, weights={"coding": 0.0, "safety": 1.0})
+        assert len(result) == 3
+
+    def test_float_edge_case_inner_loop_always_selects(self, tmp_path: Path) -> None:
+        from pyrecall.replay import _weighted_sample_without_replacement
+
+        pool = [{"text": str(i), "category": None} for i in range(5)]
+        weights = [0.1, 0.2, 0.3, 0.2, 0.2]
+        for _ in range(50):
+            result = _weighted_sample_without_replacement(list(pool), list(weights), k=5)
+            assert len(result) == 5, f"expected 5 items, got {len(result)}: {result}"
+
+    def test_sample_k_equals_buffer_size_returns_all(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        texts = [f"text_{i}" for i in range(5)]
+        buf.add(texts, categories=["coding"] * 5)
+        result = buf.sample(5, weights={"coding": 0.0})
+        assert len(result) == 5
+
+
+class TestCorruptBufferLoad:
+    def test_corrupt_entry_is_skipped_not_fatal(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["good entry"])
+        # Inject a corrupt line directly into the file
+        buf._path.write_text(buf._path.read_text().rstrip("\n") + "\nnot json at all\n")
+        buf2 = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        assert len(buf2) == 1
+        assert buf2.sample(1) == ["good entry"]
+
+    def test_entry_missing_text_key_is_skipped(self, tmp_path: Path) -> None:
+        import json
+
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["good"])
+        buf._path.write_text(
+            buf._path.read_text().rstrip("\n") + "\n" + json.dumps({"category": "coding"}) + "\n"
+        )
+        buf2 = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        assert len(buf2) == 1
+
+    def test_all_zero_weights_empty_pool_does_not_crash(self, tmp_path: Path) -> None:
+        from pyrecall.replay import _weighted_sample_without_replacement
+
+        result = _weighted_sample_without_replacement([], [], k=3)
+        assert result == []
+
+
+class TestSeenHashesPersisted:
+    def test_evicted_entry_not_readded_after_restart(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=2, base_dir=tmp_path)
+        buf.add(["a", "b", "c"])  # c evicts one; total_seen=3, buffer has 2
+        total_before = buf.total_seen
+
+        buf2 = ReplayBuffer("m", max_size=2, base_dir=tmp_path)
+        buf2.add(["a", "b", "c"])  # all three should be seen as duplicates
+        assert buf2.total_seen == total_before  # no inflation
+
+    def test_seen_hashes_survive_restart(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        buf.add(["hello", "world"])
+
+        buf2 = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        duplicates_before = buf2.total_seen
+        buf2.add(["hello", "world"])
+        assert buf2.total_seen == duplicates_before  # no re-count
+
+
+class TestReplayBufferTrimOnLoad:
+    """#132: trimming on load must use random.sample, not tail-slice."""
+
+    def test_trim_preserves_random_distribution(self, tmp_path: Path) -> None:
+        from pyrecall.replay import ReplayBuffer
+
+        buf = ReplayBuffer("m", max_size=100, base_dir=tmp_path)
+        buf.add([f"example {i}" for i in range(100)])
+
+        # Reload with smaller max_size.
+        buf2 = ReplayBuffer("m", max_size=10, base_dir=tmp_path)
+        assert len(buf2) == 10
+        texts = {e["text"] for e in buf2._buffer}
+        # Entries should not all be from the first 10 (which would happen with slice).
+        # With 100 items trimmed to 10, chance all 10 are the first 10 is astronomically small.
+        first_ten = {f"example {i}" for i in range(10)}
+        assert texts != first_ten

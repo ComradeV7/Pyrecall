@@ -83,6 +83,7 @@ def patched_model(tmp_snapshot_dir: Path):
         patch("pyrecall.model.get_peft_model", return_value=mock_peft),
         patch("pyrecall.model.compute_embeddings", return_value=torch.randn(32)),
         patch("pyrecall.model.cosine_similarity", return_value=0.75),
+        patch("pyrecall.model.compute_log_likelihood", return_value=0.368),
     ):
         from pyrecall.model import Model
 
@@ -128,12 +129,23 @@ class TestModelGenerate:
 class TestModelSnapshot:
     def test_snapshot_saves_json(self, patched_model, tmp_snapshot_dir: Path) -> None:
         patched_model.snapshot(name="test_snap")
-        snap_file = tmp_snapshot_dir / "test_snap" / "snapshot.json"
+        snap_file = tmp_snapshot_dir / "test--model" / "test_snap" / "snapshot.json"
         assert snap_file.exists(), "snapshot.json must be written to disk"
 
     def test_snapshot_sets_baseline(self, patched_model) -> None:
         patched_model.snapshot(name="baseline")
         assert patched_model._baseline_snapshot_name == "baseline"
+
+    def test_set_baseline_logs_warning_on_oserror(self, patched_model) -> None:
+        """_set_baseline() must warn (not silently pass) when the file write fails (#103)."""
+        mock_path = MagicMock()
+        mock_path.write_text.side_effect = OSError("disk full")
+        patched_model._baseline_file = mock_path
+
+        with patch("pyrecall.model.logger") as mock_logger:
+            patched_model._set_baseline("my_snap")
+            mock_logger.warning.assert_called_once()
+        assert patched_model._baseline_snapshot_name == "my_snap"
 
     def test_snapshot_returns_skill_snapshot(self, patched_model) -> None:
         from pyrecall.snapshot import SkillSnapshot
@@ -144,7 +156,8 @@ class TestModelSnapshot:
     def test_snapshot_has_correct_score_count(self, patched_model) -> None:
         from pyrecall.benchmarks.default import DEFAULT_BENCHMARKS
 
-        snap = patched_model.snapshot(name="count_test")
+        with patch("pyrecall.model.CustomBenchmarkManager.load_all", return_value=[]):
+            snap = patched_model.snapshot(name="count_test")
         assert len(snap.scores) == len(DEFAULT_BENCHMARKS)
 
     def test_snapshot_scores_normalised(self, patched_model) -> None:
@@ -733,3 +746,207 @@ class TestOnForgettingCallbacks:
 
             m = Model("test/model", snapshot_dir=tmp_snapshot_dir, on_forgetting=[cb1, cb2])
         assert m._on_forgetting == [cb1, cb2]
+
+
+# ── Streaming learn tests ─────────────────────────────────────────────────────
+
+
+class TestStreamingLearn:
+    def _run_learn_stream(self, patched_model, data_file, stream: bool):
+        mock_trainer = MagicMock()
+        trainer_cls = MagicMock(return_value=mock_trainer)
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer", trainer_cls),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.__len__.return_value = 4
+            mock_dataset.num_rows = 4
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+
+            patched_model.learn(str(data_file), epochs=1, stream=stream)
+        return trainer_cls
+
+    def test_stream_false_no_callbacks(self, patched_model, tmp_path: Path) -> None:
+        from pyrecall.model import _StreamingCallback
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        trainer_cls = self._run_learn_stream(patched_model, data_file, stream=False)
+
+        _, kwargs = trainer_cls.call_args
+        callbacks = kwargs.get("callbacks", [])
+        assert not any(isinstance(cb, _StreamingCallback) for cb in callbacks)
+
+    def test_stream_true_installs_callback(self, patched_model, tmp_path: Path) -> None:
+        from pyrecall.model import _StreamingCallback
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        trainer_cls = self._run_learn_stream(patched_model, data_file, stream=True)
+
+        _, kwargs = trainer_cls.call_args
+        callbacks = kwargs.get("callbacks", [])
+        assert any(isinstance(cb, _StreamingCallback) for cb in callbacks)
+
+    def test_streaming_callback_on_log_updates_loss(self) -> None:
+        from unittest.mock import patch as _patch
+
+        from pyrecall.model import _StreamingCallback
+
+        cb = _StreamingCallback(total_steps=10)
+        with (
+            _patch.object(cb._progress, "update") as mock_update,
+            _patch.object(cb._progress, "start"),
+        ):
+            state = MagicMock()
+            state.global_step = 3
+            cb.on_train_begin(None, state, None)
+            cb.on_log(None, state, None, logs={"loss": 0.4567})
+            mock_update.assert_called()
+            assert cb.last_loss == pytest.approx(0.4567)
+
+    def test_streaming_callback_ignores_missing_loss(self) -> None:
+        from unittest.mock import patch as _patch
+
+        from pyrecall.model import _StreamingCallback
+
+        cb = _StreamingCallback(total_steps=5)
+        with (
+            _patch.object(cb._progress, "update") as mock_update,
+            _patch.object(cb._progress, "start"),
+        ):
+            state = MagicMock()
+            state.global_step = 1
+            cb.on_train_begin(None, state, None)
+            cb.on_log(None, state, None, logs={"learning_rate": 2e-4})
+            mock_update.assert_not_called()
+            assert cb.last_loss is None
+
+    def test_stream_error_is_reraised(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text('{"text": "hi"}\n')
+
+        mock_trainer = MagicMock()
+        mock_trainer.train.side_effect = RuntimeError("GPU OOM")
+
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.__len__.return_value = 4
+            mock_dataset.num_rows = 4
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+
+            with pytest.raises(RuntimeError, match="GPU OOM"):
+                patched_model.learn(str(data_file), epochs=1, stream=True)
+
+    def test_stream_progress_stopped_on_trainer_error(self, patched_model, tmp_path: Path) -> None:
+        from unittest.mock import patch as _patch
+
+        from pyrecall.model import _StreamingCallback
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text('{"text": "hi"}\n')
+
+        captured: list[_StreamingCallback] = []
+        original_init = _StreamingCallback.__init__
+
+        def spy_init(self_cb, *args, **kwargs):
+            original_init(self_cb, *args, **kwargs)
+            self_cb._progress.stop = MagicMock()
+            captured.append(self_cb)
+
+        mock_trainer = MagicMock()
+        mock_trainer.train.side_effect = RuntimeError("GPU OOM")
+
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer", return_value=mock_trainer),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+            _patch.object(_StreamingCallback, "__init__", spy_init),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.__len__.return_value = 4
+            mock_dataset.num_rows = 4
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+
+            with pytest.raises(RuntimeError, match="GPU OOM"):
+                patched_model.learn(str(data_file), epochs=1, stream=True)
+
+        assert captured, "no _StreamingCallback was instantiated"
+        captured[0]._progress.stop.assert_called()
+
+
+class TestReplayWeightsValidation:
+    """learn() must raise immediately on negative replay_weights values."""
+
+    def _run_learn(self, patched_model, data_file, **kwargs):
+        with (
+            patch("pyrecall.model.load_dataset") as mock_ds,
+            patch("pyrecall.model.Trainer"),
+            patch("pyrecall.model.TrainingArguments"),
+            patch("pyrecall.model.DataCollatorForLanguageModeling"),
+        ):
+            mock_dataset = MagicMock()
+            mock_dataset.column_names = ["text"]
+            mock_dataset.__len__.return_value = 4
+            mock_dataset.num_rows = 4
+            mock_dataset.map.return_value = mock_dataset
+            mock_ds.return_value = mock_dataset
+            patched_model.learn(str(data_file), epochs=1, **kwargs)
+
+    def test_negative_weight_raises(self, patched_model, tmp_path: Path) -> None:
+        from pyrecall.model import PyrecallError
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        with pytest.raises(PyrecallError, match="non-negative"):
+            self._run_learn(patched_model, data_file, replay_weights={"coding": -1.0})
+
+    def test_negative_weight_names_bad_key_in_error(self, patched_model, tmp_path: Path) -> None:
+        from pyrecall.model import PyrecallError
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        with pytest.raises(PyrecallError, match="safety"):
+            self._run_learn(
+                patched_model, data_file, replay_weights={"safety": -0.5, "coding": 2.0}
+            )
+
+    def test_zero_weight_is_accepted(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        self._run_learn(patched_model, data_file, replay_weights={"coding": 0.0, "safety": 2.0})
+
+    def test_positive_weights_accepted(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        self._run_learn(patched_model, data_file, replay_weights={"coding": 3.0, "safety": 1.0})
+
+    def test_none_weights_accepted(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        self._run_learn(patched_model, data_file, replay_weights=None)
+
+    def test_multiple_negative_all_named_in_error(self, patched_model, tmp_path: Path) -> None:
+        from pyrecall.model import PyrecallError
+
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+        with pytest.raises(PyrecallError):
+            self._run_learn(
+                patched_model, data_file, replay_weights={"coding": -1.0, "safety": -2.0}
+            )

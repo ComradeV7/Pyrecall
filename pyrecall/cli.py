@@ -255,7 +255,7 @@ def init(
     if max_length < 1:
         errors.append(f"--max-length must be >= 1, got {max_length}")
     if not 0.0 < threshold <= 1.0:
-        errors.append(f"--threshold must be between 0 and 1, got {threshold}")
+        errors.append(f"--threshold must be > 0 and <= 1, got {threshold}")
     try:
         parsed_category_thresholds = _parse_category_thresholds(category_threshold)
     except typer.BadParameter as exc:
@@ -435,6 +435,7 @@ def learn(
         replay_buffer_size=config.get("replay_buffer_size", 500),
         replay_mix_ratio=config.get("replay_mix_ratio", 0.3),
         scoring_method=config.get("scoring_method", "log_likelihood"),
+        category_thresholds=config.get("category_thresholds", {}),
     )
 
     tracker = _build_trackers(log_wandb, log_mlflow, log_neptune, neptune_project)
@@ -556,6 +557,7 @@ def snapshot(
         replay_mix_ratio=config.get("replay_mix_ratio", 0.3),
         scoring_method=config.get("scoring_method", "log_likelihood"),
         snapshot_compression=compression,
+        category_thresholds=config.get("category_thresholds", {}),
     )
     tracker = _build_trackers(log_wandb, log_mlflow, log_neptune, neptune_project)
     model_obj.snapshot(name=name, tracker=tracker)
@@ -742,7 +744,10 @@ def check(
                     (p.stat().st_mtime for p in mgr.base_dir.rglob("snapshot.json")),
                     default=0.0,
                 )
-            except Exception:
+            except OSError as exc:
+                console.print(
+                    f"[dim][yellow]watch: could not stat snapshot directory: {exc}[/yellow][/dim]"
+                )
                 current_mtime = 0.0
 
             if current_mtime != last_mtime:
@@ -787,7 +792,7 @@ def check(
                     report = detector.compare(snap_b, snap_a)
                     if report.degraded_skills:
                         cats = ", ".join(
-                            f"{c} ({next(x.severity for x in report.comparisons if x.category == c)})"
+                            f"{c} ({next((x.severity for x in report.comparisons if x.category == c), 'UNKNOWN')})"
                             for c in report.degraded_skills
                         )
                         console.print(
@@ -1297,7 +1302,7 @@ def status() -> None:
             snap.created_at.strftime("%Y-%m-%d %H:%M"),
             f"{snap.overall_score():.3f}",
         ]
-        row += [f"{cat_scores.get(cat, 0.0):.3f}" for cat in all_categories]
+        row += [f"{cat_scores[cat]:.3f}" if cat in cat_scores else "-" for cat in all_categories]
         row.append(adapter_ok)
         table.add_row(*row)
 
@@ -1393,9 +1398,11 @@ def history(
                 )
             else:
                 report = detector.compare(snaps[i - 1], snap)
+                _comp_map = {x.category: x for x in report.comparisons}
                 dropped_notes = [
-                    f"{c} {report.comparisons[[x.category for x in report.comparisons].index(c)].delta:+.3f}"
+                    f"{c} {_comp_map[c].delta:+.3f}"
                     for c in report.degraded_skills
+                    if c in _comp_map
                 ]
                 health_rows.append(
                     {
@@ -1514,10 +1521,13 @@ def history(
             overall_str,
         ]
         for cat in display_categories:
-            score = cat_scores.get(cat, 0.0)
+            if cat not in cat_scores:
+                row.append("-")
+                continue
+            score = cat_scores[cat]
             cell = f"{score:.3f}"
-            if prev is not None:
-                cell += f" {_trend(prev.get(cat, score), score)}"
+            if prev is not None and cat in prev:
+                cell += f" {_trend(prev[cat], score)}"
             row.append(cell)
 
         table.add_row(*row)
@@ -1581,7 +1591,7 @@ def benchmark_add(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
 
-    entries = next(s["count"] for s in mgr.suites() if s["name"] == registered)
+    entries = next((s["count"] for s in mgr.suites() if s["name"] == registered), 0)
     console.print(
         f"[green]✓[/green] Registered benchmark suite [bold]{registered}[/bold] "
         f"({entries} prompt{'s' if entries != 1 else ''})."
@@ -1967,7 +1977,7 @@ def export(
                 "overall": round(snap.overall_score(), 4),
             }
             for cat in all_categories:
-                row[cat] = round(cat_scores.get(cat, 0.0), 4)
+                row[cat] = round(cat_scores[cat], 4) if cat in cat_scores else ""
             rows.append(row)
 
         if output:
