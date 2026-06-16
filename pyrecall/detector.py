@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from io import StringIO
 
@@ -11,6 +12,12 @@ from rich.table import Table
 
 from .snapshot import SkillSnapshot
 from .utils import console as _shared_console
+
+
+def _safe_round(value: float, ndigits: int) -> float | None:
+    """Round *value* to *ndigits* decimal places, returning None for NaN."""
+    return None if math.isnan(value) else round(value, ndigits)
+
 
 # Delta-bucket thresholds used when n_items < 2 and effect size is unavailable.
 _DELTA_MINOR: float = 0.05
@@ -35,9 +42,9 @@ class PromptComparison:
         return {
             "category": self.category,
             "prompt": self.prompt,
-            "score_before": round(self.score_before, 4),
-            "score_after": round(self.score_after, 4),
-            "delta": round(self.delta, 4),
+            "score_before": _safe_round(self.score_before, 4),
+            "score_after": _safe_round(self.score_after, 4),
+            "delta": _safe_round(self.delta, 4),
         }
 
 
@@ -57,10 +64,17 @@ class CategoryComparison:
     def severity_method(self) -> str:
         """Which method was used to compute :attr:`severity`.
 
-        ``"effect_size"`` — standardized effect size of per-item deltas (n_items ≥ 2).
-        ``"delta"``       — absolute score-drop buckets (n_items < 2 fallback).
+        ``"effect_size"`` — standardized effect size of per-item deltas (n_items ≥ 2 with variance).
+        ``"delta"``       — absolute score-drop buckets (n_items < 2, or zero-variance fallback).
+        ``"unknown"``     — one or both scores are NaN.
         """
-        return "effect_size" if self.n_items >= 2 else "delta"
+        if math.isnan(self.score_before) or math.isnan(self.score_after):
+            return "unknown"
+        if self.n_items < 2:
+            return "delta"
+        if self.cohen_d == 0.0 and self.delta < 0:
+            return "delta"
+        return "effect_size"
 
     @property
     def delta(self) -> float:
@@ -70,6 +84,8 @@ class CategoryComparison:
     @property
     def pct_change(self) -> float:
         """Percentage change relative to the before score."""
+        if math.isnan(self.score_before) or math.isnan(self.score_after):
+            return float("nan")
         if self.score_before == 0.0:
             return 0.0
         return (self.score_after - self.score_before) / self.score_before * 100.0
@@ -101,20 +117,29 @@ class CategoryComparison:
     def severity(self) -> str:
         """Human-readable forgetting severity.
 
-        Uses Cohen's d effect size when n_items ≥ 2; falls back to
-        threshold_based_severity (absolute delta buckets) for single-item categories.
+        Uses Cohen's d effect size when n_items ≥ 2 and per-item deltas have variance.
+        Falls back to threshold_based_severity (absolute delta buckets) when n_items < 2
+        or when all per-item deltas are identical (zero variance — cohen_d would be 0
+        due to undefined std, not because the drop is small).
 
         OK       — no meaningful drop
         MINOR    — small effect (|d| < 0.2), possible noise
         MODERATE — small-medium effect (0.2 ≤ |d| < 0.5)
         SEVERE   — medium-large effect (0.5 ≤ |d| < 0.8)
         CRITICAL — large effect (|d| ≥ 0.8)
+        UNKNOWN  — one or both scores are NaN (prompt exceeded max_length)
         """
+        if math.isnan(self.score_before) or math.isnan(self.score_after):
+            return "UNKNOWN"
         if self.n_items < 2:
             return self.threshold_based_severity
         if self.delta >= 0:
             return "OK"
         d = abs(self.cohen_d)
+        if d == 0.0:
+            # std_d was zero — all per-prompt deltas are identical; cohen_d is meaningless.
+            # The drop is real, so fall back to absolute delta buckets.
+            return self.threshold_based_severity
         if d >= 0.8:
             return "CRITICAL"
         if d >= 0.5:
@@ -148,11 +173,13 @@ class ForgettingReport:
 
     @property
     def degraded_skills(self) -> list[str]:
-        """Categories whose score dropped more than their effective threshold."""
+        """Categories whose score dropped more than their effective threshold, or contain NaN scores."""
         return [
             c.category
             for c in self.comparisons
-            if (c.score_before - c.score_after) > self._threshold_for(c.category)
+            if math.isnan(c.score_before)
+            or math.isnan(c.score_after)
+            or (c.score_before - c.score_after) > self._threshold_for(c.category)
         ]
 
     @property
@@ -183,10 +210,10 @@ class ForgettingReport:
             "comparisons": [
                 {
                     "category": c.category,
-                    "score_before": round(c.score_before, 4),
-                    "score_after": round(c.score_after, 4),
-                    "delta": round(c.delta, 4),
-                    "pct_change": round(c.pct_change, 2),
+                    "score_before": _safe_round(c.score_before, 4),
+                    "score_after": _safe_round(c.score_after, 4),
+                    "delta": _safe_round(c.delta, 4),
+                    "pct_change": _safe_round(c.pct_change, 2),
                     "threshold": self._threshold_for(c.category),
                     "cohen_d": round(c.cohen_d, 4),
                     "n_items": c.n_items,
@@ -221,8 +248,9 @@ class ForgettingReport:
             delta_str = f"{'+' if c.delta >= 0 else ''}{c.delta:.3f}"
             forgotten = (c.score_before - c.score_after) > self._threshold_for(c.category)
             status = "❌ FORGOTTEN" if forgotten else "✅ OK"
+            safe_cat = c.category.replace("|", "\\|")
             lines.append(
-                f"| {c.category} "
+                f"| {safe_cat} "
                 f"| {c.score_before:.3f} "
                 f"| {c.score_after:.3f} "
                 f"| {delta_str} "
@@ -259,13 +287,15 @@ class ForgettingReport:
         max_score = 1.0
         bar_area_w = chart_w - label_w - 10
 
+        import html as _html
+
         svg_rows: list[str] = []
         for i, c in enumerate(self.comparisons):
             y = i * (bar_h * 2 + bar_gap)
             before_w = int(c.score_before / max_score * bar_area_w)
             after_w = int(c.score_after / max_score * bar_area_w)
             color = severity_colours.get(c.severity, "#0969da")
-            label = c.category.replace("_", " ")
+            label = _html.escape(c.category.replace("_", " "))
             svg_rows.append(
                 f'<text x="{label_w - 6}" y="{y + bar_h - 4}" '
                 f'text-anchor="end" font-size="11" fill="#57606a">{label}</text>'
@@ -306,7 +336,7 @@ class ForgettingReport:
             )
             table_rows.append(
                 f"<tr>"
-                f"<td>{c.category}</td>"
+                f"<td>{_html.escape(c.category)}</td>"
                 f"<td>{c.score_before:.3f}</td>"
                 f"<td>{c.score_after:.3f}</td>"
                 f'<td style="color:{sev_col}">{delta_str}</td>'
@@ -320,7 +350,9 @@ class ForgettingReport:
         if self.degraded_skills:
             degraded_html = (
                 f'<p style="margin-top:12px;color:#cf222e">'
-                f"⚠ Degraded skills: <strong>{', '.join(self.degraded_skills)}</strong></p>"
+                f"⚠ Degraded skills: <strong>"
+                f"{', '.join(_html.escape(s) for s in self.degraded_skills)}"
+                f"</strong></p>"
             )
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -594,15 +626,30 @@ class ForgettingDetector:
                 )
             )
 
-        # Warn when snapshots used different scoring methods.
-        before_methods = {s.scoring_method for s in before.scores}
-        after_methods = {s.scoring_method for s in after.scores}
-        if before_methods != after_methods:
+        # Warn when NaN scores are present (prompt exceeded max_length).
+        nan_cats = [
+            c.category
+            for c in comparisons
+            if math.isnan(c.score_before) or math.isnan(c.score_after)
+        ]
+        if nan_cats:
+            from .utils import console as _c
+
+            _c.print(
+                f"[warning]⚠  NaN scores detected in categories: {', '.join(sorted(set(nan_cats)))}. "
+                "Prompts may have exceeded max_length. "
+                "These categories are flagged as degraded.[/warning]"
+            )
+
+        # Warn when snapshots used different (primary) scoring methods.
+        before_method = before.primary_scoring_method()
+        after_method = after.primary_scoring_method()
+        if before_method is not None and after_method is not None and before_method != after_method:
             from .utils import console as _c
 
             _c.print(
                 "[warning]⚠  Snapshots used different scoring methods "
-                f"({before_methods} vs {after_methods}). "
+                f"({before_method} vs {after_method}). "
                 "Scores are not directly comparable — retake one snapshot.[/warning]"
             )
 

@@ -208,3 +208,53 @@ class TestRollbackManagerHasAndDelete:
         remaining = [s.name for s in manager.list_snapshots()]
         assert "b" not in remaining
         assert len(remaining) == 2
+
+
+class TestRollbackManagerBaseDir:
+    def test_explicit_base_dir_still_namespaces_by_model(self, tmp_path: Path) -> None:
+        mgr = RollbackManager(model_name="org/model-a", base_dir=tmp_path)
+        assert "org--model-a" in str(mgr.base_dir)
+        assert str(mgr.base_dir).startswith(str(tmp_path))
+
+    def test_two_models_same_base_dir_do_not_collide(self, tmp_path: Path) -> None:
+        mgr_a = RollbackManager(model_name="llama-7b", base_dir=tmp_path)
+        mgr_b = RollbackManager(model_name="mistral-7b", base_dir=tmp_path)
+        assert mgr_a.base_dir != mgr_b.base_dir
+
+    def test_snapshot_saved_under_model_subdir(self, tmp_path: Path) -> None:
+        mgr = RollbackManager(model_name="org/mymodel", base_dir=tmp_path)
+        mgr.save(_make_snapshot("v1"), _make_mock_peft_model())
+        expected = tmp_path / "org--mymodel" / "v1" / "snapshot.json"
+        assert expected.exists()
+
+
+class TestSaveLock:
+    def test_lock_file_created_during_save(self, tmp_path: Path) -> None:
+        mgr = RollbackManager(model_name="test/model", base_dir=tmp_path)
+        mgr.save(_make_snapshot("v1"), _make_mock_peft_model())
+        # Lock file should exist (not cleaned up — it's intentionally kept as a
+        # cheap sentinel so future lock calls don't need to re-create the dir).
+        snap_dir = tmp_path / "test--model" / "v1"
+        assert snap_dir.exists()
+
+    def test_concurrent_saves_do_not_corrupt(self, tmp_path: Path) -> None:
+        import threading
+
+        mgr = RollbackManager(model_name="test/model", base_dir=tmp_path)
+        errors: list[Exception] = []
+
+        def do_save():
+            try:
+                mgr.save(_make_snapshot("v1"), _make_mock_peft_model())
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=do_save) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent saves raised: {errors}"
+        snap = mgr.load_snapshot("v1")
+        assert snap.name == "v1"

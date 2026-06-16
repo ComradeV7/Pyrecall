@@ -57,6 +57,19 @@ class TestSkillScore:
 # ── SkillSnapshot aggregation ──────────────────────────────────────────────────
 
 
+class TestSkillSnapshotConstruction:
+    def test_positional_scores_arg_raises_type_error(self) -> None:
+        score = SkillScore(category="safety", prompt="p", response="c", score=0.5)
+        with pytest.raises(TypeError, match="created_at must be a datetime"):
+            SkillSnapshot("v1", "llama", [score])
+
+    def test_keyword_args_construct_correctly(self) -> None:
+        score = SkillScore(category="safety", prompt="p", response="c", score=0.5)
+        snap = SkillSnapshot(name="v1", model_name="llama", scores=[score])
+        assert snap.scores == [score]
+        assert isinstance(snap.created_at, datetime)
+
+
 class TestSkillSnapshotAggregation:
     def test_overall_score_is_mean(self) -> None:
         snap = _make_snapshot()
@@ -380,3 +393,100 @@ class TestEncryptor:
             importlib.reload(enc_mod)
             with pytest.raises(ImportError, match="privacy"):
                 enc_mod.Encryptor()
+
+
+class TestOverallScoreCategoryBalanced:
+    def test_overall_score_is_category_balanced(self) -> None:
+        scores = [
+            SkillScore(category="math", prompt=f"p{i}", response="r", score=0.9) for i in range(10)
+        ] + [
+            SkillScore(category="coding", prompt=f"q{i}", response="r", score=0.1) for i in range(2)
+        ]
+        snap = SkillSnapshot(name="s", model_name="m", scores=scores)
+        # category-balanced: (0.9 + 0.1) / 2 = 0.5, not prompt-weighted ~0.85
+        assert abs(snap.overall_score() - 0.5) < 1e-9
+
+    def test_overall_score_equal_categories_unchanged(self) -> None:
+        scores = [
+            SkillScore(category="a", prompt="p1", response="r", score=0.8),
+            SkillScore(category="b", prompt="p2", response="r", score=0.6),
+        ]
+        snap = SkillSnapshot(name="s", model_name="m", scores=scores)
+        assert abs(snap.overall_score() - 0.7) < 1e-9
+
+    def test_overall_score_empty_returns_zero(self) -> None:
+        snap = SkillSnapshot(name="s", model_name="m")
+        assert snap.overall_score() == 0.0
+
+    def test_overall_score_single_category(self) -> None:
+        scores = [
+            SkillScore(category="coding", prompt=f"p{i}", response="r", score=0.8) for i in range(5)
+        ]
+        snap = SkillSnapshot(name="s", model_name="m", scores=scores)
+        assert abs(snap.overall_score() - 0.8) < 1e-9
+
+
+class TestEncryptedSnapshotAdapterCompression:
+    """#128: privacy=True must persist adapter_compression."""
+
+    def test_save_and_load_preserves_adapter_compression(self, tmp_path: Path) -> None:
+        pytest.importorskip("cryptography")
+        snap = _make_snapshot()
+        snap.adapter_compression = "zstd"
+        snap.save(tmp_path, privacy=True)
+        loaded = SkillSnapshot.load(tmp_path, privacy=True)
+        assert loaded.adapter_compression == "zstd"
+
+    def test_save_and_load_none_compression_still_works(self, tmp_path: Path) -> None:
+        pytest.importorskip("cryptography")
+        snap = _make_snapshot()
+        snap.save(tmp_path, privacy=True)
+        loaded = SkillSnapshot.load(tmp_path, privacy=True)
+        assert loaded.adapter_compression == "none"
+
+
+class TestLoadEncryptedWithoutPrivacyFlag:
+    """#129: load() must raise when file is encrypted but privacy=False."""
+
+    def test_raises_valueerror_on_encrypted_file_loaded_without_privacy(
+        self, tmp_path: Path
+    ) -> None:
+        pytest.importorskip("cryptography")
+        snap = _make_snapshot()
+        snap.save(tmp_path, privacy=True)
+        with pytest.raises(ValueError, match="encrypted"):
+            SkillSnapshot.load(tmp_path, privacy=False)
+
+    def test_non_encrypted_file_loads_without_privacy(self, tmp_path: Path) -> None:
+        snap = _make_snapshot()
+        snap.save(tmp_path, privacy=False)
+        loaded = SkillSnapshot.load(tmp_path, privacy=False)
+        assert loaded.name == snap.name
+
+
+class TestPrimaryScoringMethod:
+    """#133: detector should compare the dominant method, not the full per-score set."""
+
+    def test_returns_none_for_empty_scores(self) -> None:
+        snap = SkillSnapshot(name="s", model_name="m")
+        assert snap.primary_scoring_method() is None
+
+    def test_returns_method_when_all_scores_agree(self) -> None:
+        scores = [
+            SkillScore(
+                category="c", prompt="p", response="r", score=0.5, scoring_method="log_likelihood"
+            )
+            for _ in range(5)
+        ]
+        snap = SkillSnapshot(name="s", model_name="m", scores=scores)
+        assert snap.primary_scoring_method() == "log_likelihood"
+
+    def test_returns_majority_method_when_mixed(self) -> None:
+        scores = [
+            SkillScore(
+                category="c", prompt="p", response="r", score=0.5, scoring_method="log_likelihood"
+            )
+            for _ in range(9)
+        ] + [SkillScore(category="c", prompt="p", response="r", score=0.5, scoring_method="cosine")]
+        snap = SkillSnapshot(name="s", model_name="m", scores=scores)
+        assert snap.primary_scoring_method() == "log_likelihood"

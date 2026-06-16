@@ -57,6 +57,13 @@ class SkillSnapshot:
     encrypted: bool = False
     adapter_compression: str = "none"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.created_at, datetime):
+            raise TypeError(
+                f"created_at must be a datetime, got {type(self.created_at).__name__}. "
+                "Use keyword arguments: SkillSnapshot(name=..., model_name=..., scores=...)"
+            )
+
     # ── aggregation ────────────────────────────────────────────────────────────
     def category_scores(self) -> dict[str, float]:
         """Return average score per category."""
@@ -66,14 +73,36 @@ class SkillSnapshot:
         return {cat: sum(vals) / len(vals) for cat, vals in buckets.items()}
 
     def overall_score(self) -> float:
-        """Return the mean score across all benchmarks."""
-        if not self.scores:
+        """Return the mean of per-category averages, so every skill is weighted equally."""
+        cat_scores = self.category_scores()
+        if not cat_scores:
             return 0.0
-        return sum(s.score for s in self.scores) / len(self.scores)
+        return sum(cat_scores.values()) / len(cat_scores)
+
+    def primary_scoring_method(self) -> str | None:
+        """Return the most common ``scoring_method`` across all scores.
+
+        Used (instead of comparing the full set of per-score methods) so a
+        snapshot loaded with a handful of legacy scores defaulting to
+        ``"cosine"`` (see :meth:`SkillScore.from_dict`) isn't flagged as
+        mismatched against a snapshot that is overwhelmingly one method.
+        """
+        if not self.scores:
+            return None
+        counts: dict[str, int] = {}
+        for s in self.scores:
+            counts[s.scoring_method] = counts.get(s.scoring_method, 0) + 1
+        return max(counts, key=lambda k: counts[k])
 
     # ── persistence ────────────────────────────────────────────────────────────
     def save(self, directory: Path, privacy: bool = False) -> None:
-        """Write snapshot metadata to *directory*/snapshot.json."""
+        """Write snapshot metadata to ``directory/snapshot.json``.
+
+        The file is always named ``snapshot.json`` inside *directory* —
+        no subdirectory is created from the snapshot name.  Pass the
+        snapshot's own directory (e.g. ``base / snapshot.name``) if you
+        want the canonical on-disk layout used by :class:`RollbackManager`.
+        """
         directory.mkdir(parents=True, exist_ok=True)
         if not privacy:
             data = {
@@ -107,6 +136,7 @@ class SkillSnapshot:
                 "adapter_path": (
                     encryptor.encrypt(str(self.adapter_path)) if self.adapter_path else None
                 ),
+                "adapter_compression": self.adapter_compression,
             }
         (directory / "snapshot.json").write_text(json.dumps(data, indent=2))
 
@@ -125,6 +155,11 @@ class SkillSnapshot:
             raise ValueError(
                 f"Snapshot file '{snapshot_file}' is corrupted (invalid JSON): {exc}"
             ) from exc
+        if data.get("encrypted", False) and not privacy:
+            raise ValueError(
+                f"Snapshot '{snapshot_file}' is encrypted but privacy=False was passed. "
+                "Load it with privacy=True and supply the key."
+            )
         if privacy:
             from .encrypt import Encryptor
 
@@ -150,6 +185,7 @@ class SkillSnapshot:
                 adapter_path=(
                     Path(encryptor.decrypt(data["adapter_path"])) if data["adapter_path"] else None
                 ),
+                adapter_compression=data.get("adapter_compression", "none"),
                 encrypted=True,
             )
         return cls(

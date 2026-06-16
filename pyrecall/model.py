@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -13,13 +14,21 @@ import torch
 from datasets import Dataset as _HFDataset
 from datasets import concatenate_datasets, load_dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model, prepare_model_for_kbit_training
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -89,6 +98,45 @@ def _fire_callbacks(
                 f"pyrecall: callback {cb!r} raised {type(exc).__name__}: {exc}",
                 stacklevel=2,
             )
+
+
+class _StreamingCallback(TrainerCallback):
+    """Rich progress bar that surfaces per-step loss during model.learn(stream=True)."""
+
+    def __init__(self, total_steps: int) -> None:
+        self._total = total_steps
+        self._progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("loss: {task.fields[loss]}"),
+            TimeRemainingColumn(),
+        )
+        self._task_id = self._progress.add_task("Training", total=total_steps, loss="—")
+        self.last_loss: float | None = None
+
+    def on_train_begin(self, args, state, control, **kwargs) -> None:  # type: ignore[override]
+        self._progress.start()
+
+    def on_log(self, args, state, control, logs=None, **kwargs) -> None:  # type: ignore[override]
+        if not logs:
+            return
+        loss = logs.get("loss")
+        if loss is not None:
+            self.last_loss = float(loss)
+            self._progress.update(
+                self._task_id,
+                completed=state.global_step,
+                loss=f"{loss:.4f}",
+            )
+
+    def on_train_end(self, args, state, control, **kwargs) -> None:  # type: ignore[override]
+        self._progress.update(
+            self._task_id,
+            completed=self._total,
+            loss=f"{self.last_loss:.4f}" if self.last_loss is not None else "—",
+        )
+        self._progress.stop()
 
 
 class Model:
@@ -327,6 +375,8 @@ class Model:
         max_length: int | None = None,
         resume: bool = False,
         gradient_checkpointing: bool | None = None,
+        replay_weights: dict[str, float] | ForgettingReport | None = None,
+        stream: bool = False,
     ) -> None:
         """
         Fine-tune the model on *data_path* using LoRA.
@@ -348,10 +398,39 @@ class Model:
             learning_rate: AdamW learning rate.
             max_length: Tokenisation truncation length.
             resume: If True, resume from the latest saved checkpoint (if one exists).
+            replay_weights: Bias replay sampling toward specific categories.  Pass
+                a ``dict[str, float]`` mapping category names to positive multipliers
+                (e.g. ``{"coding": 3.0, "safety": 2.0}``), or pass a
+                :class:`~pyrecall.detector.ForgettingReport` to auto-derive weights
+                from per-category severity (``CRITICAL`` → 4×, ``SEVERE`` → 3×,
+                ``MODERATE`` → 2×, ``MINOR`` → 1×).  Falls back to uniform sampling
+                when ``None`` or when buffer entries have no category metadata.
+            stream: If True, display a live Rich progress bar with per-step loss
+                during training.  Default False keeps the current silent behaviour.
         """
         batch_size = batch_size if batch_size is not None else self.batch_size
         learning_rate = learning_rate if learning_rate is not None else self.learning_rate
         max_length = max_length if max_length is not None else self.max_length
+
+        _SEVERITY_WEIGHT: dict[str, float] = {
+            "CRITICAL": 4.0,
+            "SEVERE": 3.0,
+            "MODERATE": 2.0,
+            "MINOR": 1.0,
+        }
+        resolved_replay_weights: dict[str, float] | None = None
+        if isinstance(replay_weights, ForgettingReport):
+            resolved_replay_weights = {
+                cat: _SEVERITY_WEIGHT.get(sev, 1.0) for cat, sev in replay_weights.severity.items()
+            }
+        elif replay_weights is not None:
+            bad = {k: v for k, v in replay_weights.items() if v < 0}
+            if bad:
+                raise PyrecallError(
+                    f"replay_weights values must be non-negative; got {bad}. "
+                    "Use 0.0 to exclude a category entirely."
+                )
+            resolved_replay_weights = replay_weights
 
         data_file = Path(data_path)
         if not data_file.exists():
@@ -410,9 +489,14 @@ class Model:
 
         if row_count == 0:
             raise PyrecallError(f"Training data '{data_path}' is empty.")
-        # Collect the raw new texts now (before any mixing) so we can add them
-        # to the replay buffer after training without including replayed examples.
+        # Collect the raw new texts (and categories if present) before mixing,
+        # so we only add truly new examples to the replay buffer after training.
         new_texts: list[str] = dataset[text_col] if self.replay_buffer is not None else []
+        new_categories: list[str | None] = (
+            list(dataset["category"])
+            if self.replay_buffer is not None and "category" in dataset.column_names
+            else [None] * len(new_texts)
+        )
 
         # Mix in replay examples before tokenisation.
         if self.replay_buffer is not None and len(self.replay_buffer) > 0:
@@ -420,7 +504,7 @@ class Model:
                 len(self.replay_buffer),
                 max(1, int(len(dataset) * self._replay_mix_ratio)),
             )
-            replay_texts = self.replay_buffer.sample(n_replay)
+            replay_texts = self.replay_buffer.sample(n_replay, weights=resolved_replay_weights)
             replay_ds = _HFDataset.from_dict({"text": replay_texts})
             new_only = (
                 dataset.select_columns([text_col]).rename_column(text_col, "text")
@@ -429,9 +513,10 @@ class Model:
             )
             dataset = concatenate_datasets([new_only, replay_ds])
             text_col = "text"
+            weight_note = " (category-weighted)" if resolved_replay_weights else ""
             console.print(
                 f"[info]Replay: mixed in {n_replay} past examples "
-                f"({n_replay / len(dataset):.0%} of batch).[/info]"
+                f"({n_replay / len(dataset):.0%} of batch){weight_note}.[/info]"
             )
 
         def _tokenize(batch: dict[str, list]) -> dict:
@@ -458,12 +543,15 @@ class Model:
         if use_gc:
             self.model.gradient_checkpointing_enable()
 
+        total_steps = max(1, math.ceil(len(tokenized) / batch_size)) * epochs
+        logging_steps = 1 if stream else save_steps
+
         args = TrainingArguments(
             output_dir=str(run_dir),
             num_train_epochs=epochs,
             per_device_train_batch_size=batch_size,
             learning_rate=learning_rate,
-            logging_steps=save_steps,
+            logging_steps=logging_steps,
             save_strategy="steps",
             save_steps=save_steps,
             save_total_limit=2,
@@ -475,11 +563,15 @@ class Model:
 
         collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
 
+        callbacks: list[TrainerCallback] = (
+            [_StreamingCallback(total_steps=total_steps)] if stream else []
+        )
         trainer = Trainer(
             model=self.model,
             args=args,
             train_dataset=tokenized,
             data_collator=collator,
+            callbacks=callbacks,
         )
 
         # Find latest checkpoint when resuming
@@ -494,12 +586,18 @@ class Model:
             else:
                 console.print("[warning]No checkpoint found — starting from scratch.[/warning]")
 
+        streaming_cb = next((cb for cb in callbacks if isinstance(cb, _StreamingCallback)), None)
         self.model.train()
-        trainer.train(resume_from_checkpoint=resume_from)
+        try:
+            trainer.train(resume_from_checkpoint=resume_from)
+        except Exception:
+            if streaming_cb is not None:
+                streaming_cb._progress.stop()
+            raise
         self.model.eval()
 
         if self.replay_buffer is not None and new_texts:
-            self.replay_buffer.add(new_texts)
+            self.replay_buffer.add(new_texts, categories=new_categories)
             console.print(
                 f"[dim]  Replay buffer updated: {len(self.replay_buffer)} / "
                 f"{self.replay_buffer.max_size} examples stored.[/dim]"
@@ -536,9 +634,11 @@ class Model:
 
         console.print("[info]Running post-training benchmarks…[/info]")
         after_scores = self._run_benchmarks()
-        after_name = f"{self._baseline_snapshot_name}__after"
-        after = SkillSnapshot(name=after_name, model_name=self.model_name, scores=after_scores)
-        after.save(self.rollback_manager.base_dir / after_name)
+        after = SkillSnapshot(
+            name=f"{self._baseline_snapshot_name}__after",
+            model_name=self.model_name,
+            scores=after_scores,
+        )
 
         report = self.detector.compare(before, after)
         report.print()
@@ -757,8 +857,8 @@ class Model:
         self._baseline_snapshot_name = name
         try:
             self._baseline_file.write_text(name)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning("Could not persist baseline to %s: %s", self._baseline_file, exc)
 
     def _run_benchmarks(self) -> list[SkillScore]:
         """Run default + custom benchmarks and return SkillScore objects."""

@@ -571,11 +571,26 @@ class TestSingleItemSeverityFallback:
         assert c.threshold_based_severity == "CRITICAL"
 
     def test_severity_uses_cohen_d_when_n_items_ge_2(self) -> None:
-        # Large drop but tiny Cohen's d → should be MINOR via effect-size path
+        # Large drop but tiny non-zero Cohen's d → should be MINOR via effect-size path.
         c = CategoryComparison(
             category="qa", score_before=0.8, score_after=0.40, cohen_d=-0.1, n_items=5
         )
         assert c.severity == "MINOR"
+
+    def test_severity_zero_variance_multi_item_falls_back_to_delta(self) -> None:
+        # cohen_d=0 with n_items>=2 and real drop means std_d was zero (identical deltas).
+        # Must use threshold_based_severity, not return MINOR.
+        c = CategoryComparison(
+            category="safety", score_before=0.9, score_after=0.1, cohen_d=0.0, n_items=5
+        )
+        assert c.severity == "CRITICAL"
+
+    def test_severity_zero_variance_no_drop_is_ok(self) -> None:
+        # cohen_d=0 but delta>=0 → OK, not a fallback case.
+        c = CategoryComparison(
+            category="safety", score_before=0.8, score_after=0.8, cohen_d=0.0, n_items=5
+        )
+        assert c.severity == "OK"
 
     def test_render_footnote_present_for_single_item(self) -> None:
         from io import StringIO
@@ -626,6 +641,34 @@ class TestSingleItemSeverityFallback:
         assert comp.severity not in ("MINOR", "OK")
 
 
+class TestNaNScores:
+    def test_severity_unknown_when_score_before_nan(self) -> None:
+        c = CategoryComparison(category="safety", score_before=float("nan"), score_after=0.7)
+        assert c.severity == "UNKNOWN"
+
+    def test_severity_unknown_when_score_after_nan(self) -> None:
+        c = CategoryComparison(category="safety", score_before=0.8, score_after=float("nan"))
+        assert c.severity == "UNKNOWN"
+
+    def test_degraded_skills_includes_nan_category(self) -> None:
+        before = _make_snapshot("v1", {"safety": 0.8})
+        after = _make_snapshot("v2", {"safety": float("nan")})
+        report = ForgettingDetector().compare(before, after)
+        assert "safety" in report.degraded_skills
+
+    def test_is_healthy_false_when_nan_score(self) -> None:
+        before = _make_snapshot("v1", {"safety": 0.8})
+        after = _make_snapshot("v2", {"safety": float("nan")})
+        report = ForgettingDetector().compare(before, after)
+        assert report.is_healthy is False
+
+    def test_nan_in_score_before_also_flagged(self) -> None:
+        before = _make_snapshot("v1", {"safety": float("nan")})
+        after = _make_snapshot("v2", {"safety": 0.8})
+        report = ForgettingDetector().compare(before, after)
+        assert "safety" in report.degraded_skills
+
+
 class TestSeverityMethodField:
     def test_severity_method_effect_size_when_multi_item(self) -> None:
         c = CategoryComparison(
@@ -653,11 +696,21 @@ class TestSeverityMethodField:
         assert comp_dict["severity_method"] in ("effect_size", "delta")
 
     def test_severity_method_effect_size_in_to_dict_for_multi_prompt(self) -> None:
+        # Use varied deltas so std_d > 0 and cohen_d is non-zero → effect_size path.
         before = _make_snapshot_with_items("b", {"coding": [0.8, 0.7]})
-        after = _make_snapshot_with_items("a", {"coding": [0.6, 0.5]})
+        after = _make_snapshot_with_items("a", {"coding": [0.6, 0.4]})
         report = ForgettingDetector().compare(before, after)
         comp_dict = next(c for c in report.to_dict()["comparisons"] if c["category"] == "coding")
         assert comp_dict["severity_method"] == "effect_size"
+
+    def test_severity_method_delta_when_zero_variance_multi_prompt(self) -> None:
+        # Identical deltas → zero variance → cohen_d=0 → falls back to delta method.
+        before = _make_snapshot_with_items("b", {"coding": [0.9, 0.9]})
+        after = _make_snapshot_with_items("a", {"coding": [0.1, 0.1]})
+        report = ForgettingDetector().compare(before, after)
+        comp_dict = next(c for c in report.to_dict()["comparisons"] if c["category"] == "coding")
+        assert comp_dict["severity_method"] == "delta"
+        assert comp_dict["severity"] == "CRITICAL"
 
 
 class TestDeltaThresholdConstants:
@@ -674,6 +727,46 @@ class TestDeltaThresholdConstants:
         assert _DELTA_MINOR < _DELTA_MODERATE < _DELTA_SEVERE
 
 
+class TestNaNToDict:
+    def test_prompt_comparison_to_dict_nan_score_before_is_none(self) -> None:
+        import json
+
+        pc = PromptComparison(
+            category="safety", prompt="p", score_before=float("nan"), score_after=0.7
+        )
+        d = pc.to_dict()
+        assert d["score_before"] is None
+        json.dumps(d)  # must not raise
+
+    def test_prompt_comparison_to_dict_nan_score_after_is_none(self) -> None:
+        import json
+
+        pc = PromptComparison(
+            category="safety", prompt="p", score_before=0.8, score_after=float("nan")
+        )
+        d = pc.to_dict()
+        assert d["score_after"] is None
+        json.dumps(d)  # must not raise
+
+    def test_forgetting_report_to_json_with_nan_is_valid(self) -> None:
+        import json
+
+        before = _make_snapshot("v1", {"safety": 0.8})
+        after = _make_snapshot("v2", {"safety": float("nan")})
+        report = ForgettingDetector().compare(before, after)
+        parsed = json.loads(report.to_json())
+        comp = next(c for c in parsed["comparisons"] if c["category"] == "safety")
+        assert comp["score_after"] is None
+
+    def test_forgetting_report_to_dict_nan_delta_is_none(self) -> None:
+        before = _make_snapshot("v1", {"safety": float("nan")})
+        after = _make_snapshot("v2", {"safety": 0.7})
+        report = ForgettingDetector().compare(before, after)
+        comp = next(c for c in report.to_dict()["comparisons"] if c["category"] == "safety")
+        assert comp["score_before"] is None
+        assert comp["delta"] is None
+
+
 class TestBenchmarkCount:
     def test_default_benchmarks_total_180(self) -> None:
         from pyrecall.benchmarks.default import DEFAULT_BENCHMARKS
@@ -688,3 +781,122 @@ class TestBenchmarkCount:
         counts = Counter(b.category for b in DEFAULT_BENCHMARKS)
         for cat in CATEGORIES:
             assert counts[cat] == 20, f"{cat} has {counts[cat]} items, expected 20"
+
+
+class TestNaNPctChangeAndSeverityMethod:
+    def test_pct_change_nan_when_score_before_nan(self) -> None:
+        import math
+
+        c = CategoryComparison(category="safety", score_before=float("nan"), score_after=0.7)
+        assert math.isnan(c.pct_change)
+
+    def test_pct_change_nan_when_score_after_nan(self) -> None:
+        import math
+
+        c = CategoryComparison(category="safety", score_before=0.8, score_after=float("nan"))
+        assert math.isnan(c.pct_change)
+
+    def test_severity_method_unknown_when_score_before_nan(self) -> None:
+        c = CategoryComparison(
+            category="safety", score_before=float("nan"), score_after=0.7, n_items=5
+        )
+        assert c.severity_method == "unknown"
+
+    def test_severity_method_unknown_when_score_after_nan(self) -> None:
+        c = CategoryComparison(
+            category="safety", score_before=0.8, score_after=float("nan"), n_items=5
+        )
+        assert c.severity_method == "unknown"
+
+
+class TestMarkdownAndHTMLEscaping:
+    def test_pipe_in_category_name_escaped_in_markdown(self) -> None:
+        report = ForgettingReport(
+            snapshot_before="b",
+            snapshot_after="a",
+            threshold=0.1,
+            comparisons=[CategoryComparison(category="foo|bar", score_before=0.8, score_after=0.7)],
+        )
+        md = report.to_markdown()
+        table_lines = [ln for ln in md.splitlines() if ln.startswith("|") and "foo" in ln]
+        assert len(table_lines) == 1
+        assert r"foo\|bar" in table_lines[0]  # noqa: RUF001
+
+    def test_html_tag_in_category_name_escaped_in_html(self) -> None:
+        report = ForgettingReport(
+            snapshot_before="b",
+            snapshot_after="a",
+            threshold=0.1,
+            comparisons=[
+                CategoryComparison(
+                    category="<script>alert(1)</script>", score_before=0.8, score_after=0.7
+                )
+            ],
+        )
+        html = report.to_html()
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
+
+
+class TestScoringMethodMismatchWarning:
+    """#133: warning should use the dominant scoring method, not raw per-score sets."""
+
+    def test_no_warning_when_minority_legacy_scores_present(
+        self, capsys: pytest.CaptureFixture
+    ) -> None:
+        before_scores = [
+            SkillScore(
+                category="c",
+                prompt=f"p{i}",
+                response="r",
+                score=0.8,
+                scoring_method="log_likelihood",
+            )
+            for i in range(9)
+        ] + [
+            SkillScore(category="c", prompt="p9", response="r", score=0.8, scoring_method="cosine")
+        ]
+        before = SkillSnapshot(name="b", model_name="m", scores=before_scores)
+        after_scores = [
+            SkillScore(
+                category="c",
+                prompt=f"p{i}",
+                response="r",
+                score=0.8,
+                scoring_method="log_likelihood",
+            )
+            for i in range(10)
+        ]
+        after = SkillSnapshot(name="a", model_name="m", scores=after_scores)
+
+        ForgettingDetector().compare(before, after)
+        captured = capsys.readouterr()
+        assert "different scoring methods" not in captured.out
+
+    def test_warning_when_dominant_methods_differ(self, capsys: pytest.CaptureFixture) -> None:
+        before = SkillSnapshot(
+            name="b",
+            model_name="m",
+            scores=[
+                SkillScore(
+                    category="c", prompt="p", response="r", score=0.8, scoring_method="cosine"
+                )
+            ],
+        )
+        after = SkillSnapshot(
+            name="a",
+            model_name="m",
+            scores=[
+                SkillScore(
+                    category="c",
+                    prompt="p",
+                    response="r",
+                    score=0.8,
+                    scoring_method="log_likelihood",
+                )
+            ],
+        )
+
+        ForgettingDetector().compare(before, after)
+        captured = capsys.readouterr()
+        assert "different scoring methods" in captured.out
