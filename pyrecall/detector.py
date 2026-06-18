@@ -245,16 +245,24 @@ class ForgettingReport:
             "|---|---|---|---|---|---|---|",
         ]
         for c in self.comparisons:
-            delta_str = f"{'+' if c.delta >= 0 else ''}{c.delta:.3f}"
+            nan_score = math.isnan(c.score_before) or math.isnan(c.score_after)
+            before_str = "n/a" if math.isnan(c.score_before) else f"{c.score_before:.3f}"
+            after_str = "n/a" if math.isnan(c.score_after) else f"{c.score_after:.3f}"
+            delta_str = (
+                "n/a"
+                if nan_score or math.isnan(c.delta)
+                else f"{'+' if c.delta >= 0 else ''}{c.delta:.3f}"
+            )
+            cohend_str = "n/a" if nan_score or math.isnan(c.cohen_d) else f"{c.cohen_d:.3f}"
             forgotten = (c.score_before - c.score_after) > self._threshold_for(c.category)
             status = "❌ FORGOTTEN" if forgotten else "✅ OK"
             safe_cat = c.category.replace("|", "\\|")
             lines.append(
                 f"| {safe_cat} "
-                f"| {c.score_before:.3f} "
-                f"| {c.score_after:.3f} "
+                f"| {before_str} "
+                f"| {after_str} "
                 f"| {delta_str} "
-                f"| {c.cohen_d:.3f} "
+                f"| {cohend_str} "
                 f"| {c.severity} "
                 f"| {status} |"
             )
@@ -292,8 +300,12 @@ class ForgettingReport:
         svg_rows: list[str] = []
         for i, c in enumerate(self.comparisons):
             y = i * (bar_h * 2 + bar_gap)
-            before_w = int(c.score_before / max_score * bar_area_w)
-            after_w = int(c.score_after / max_score * bar_area_w)
+            before_w = (
+                0 if math.isnan(c.score_before) else int(c.score_before / max_score * bar_area_w)
+            )
+            after_w = (
+                0 if math.isnan(c.score_after) else int(c.score_after / max_score * bar_area_w)
+            )
             color = severity_colours.get(c.severity, "#0969da")
             label = _html.escape(c.category.replace("_", " "))
             svg_rows.append(
@@ -304,9 +316,11 @@ class ForgettingReport:
                 f'<rect x="{label_w}" y="{y}" width="{before_w}" height="{bar_h}" '
                 f'fill="#0969da" opacity="0.55" rx="3"/>'
             )
+            before_label = "n/a" if math.isnan(c.score_before) else f"{c.score_before:.3f}"
+            after_label = "n/a" if math.isnan(c.score_after) else f"{c.score_after:.3f}"
             svg_rows.append(
                 f'<text x="{label_w + before_w + 4}" y="{y + bar_h - 5}" '
-                f'font-size="10" fill="#57606a">{c.score_before:.3f}</text>'
+                f'font-size="10" fill="#57606a">{before_label}</text>'
             )
             svg_rows.append(
                 f'<rect x="{label_w}" y="{y + bar_h + 2}" width="{after_w}" height="{bar_h}" '
@@ -314,7 +328,7 @@ class ForgettingReport:
             )
             svg_rows.append(
                 f'<text x="{label_w + after_w + 4}" y="{y + bar_h * 2 - 3}" '
-                f'font-size="10" fill="#57606a">{c.score_after:.3f}</text>'
+                f'font-size="10" fill="#57606a">{after_label}</text>'
             )
         svg_h = len(self.comparisons) * (bar_h * 2 + bar_gap) + 10
         svg = (
@@ -326,7 +340,15 @@ class ForgettingReport:
         # Build comparison table rows.
         table_rows: list[str] = []
         for c in self.comparisons:
-            delta_str = f"{'+' if c.delta >= 0 else ''}{c.delta:.3f}"
+            nan_score = math.isnan(c.score_before) or math.isnan(c.score_after)
+            before_cell = "n/a" if math.isnan(c.score_before) else f"{c.score_before:.3f}"
+            after_cell = "n/a" if math.isnan(c.score_after) else f"{c.score_after:.3f}"
+            delta_str = (
+                "n/a"
+                if nan_score or math.isnan(c.delta)
+                else f"{'+' if c.delta >= 0 else ''}{c.delta:.3f}"
+            )
+            cohend_cell = "n/a" if nan_score or math.isnan(c.cohen_d) else f"{c.cohen_d:.3f}"
             sev_col = severity_colours.get(c.severity, "#0969da")
             forgotten = (c.score_before - c.score_after) > self._threshold_for(c.category)
             status_cell = (
@@ -337,10 +359,10 @@ class ForgettingReport:
             table_rows.append(
                 f"<tr>"
                 f"<td>{_html.escape(c.category)}</td>"
-                f"<td>{c.score_before:.3f}</td>"
-                f"<td>{c.score_after:.3f}</td>"
+                f"<td>{before_cell}</td>"
+                f"<td>{after_cell}</td>"
                 f'<td style="color:{sev_col}">{delta_str}</td>'
-                f"<td>{c.cohen_d:.3f}</td>"
+                f"<td>{cohend_cell}</td>"
                 f'<td style="color:{sev_col};font-weight:600">{c.severity}</td>'
                 f"<td>{status_cell}</td>"
                 f"</tr>"
@@ -475,11 +497,17 @@ class ForgettingReport:
 
         for comp in self.comparisons:
             cat_threshold = self._threshold_for(comp.category)
-            sign = "+" if comp.delta >= 0 else ""
-            delta_str = f"{sign}{comp.delta:.3f} ({sign}{comp.pct_change:.1f}%)"
-            delta_style = (
-                "red" if comp.delta < -cat_threshold else ("green" if comp.delta >= 0 else "yellow")
-            )
+            if math.isnan(comp.delta):
+                delta_str = "n/a"
+                delta_style = "dim"
+            else:
+                sign = "+" if comp.delta >= 0 else ""
+                delta_str = f"{sign}{comp.delta:.3f} ({sign}{comp.pct_change:.1f}%)"
+                delta_style = (
+                    "red"
+                    if comp.delta < -cat_threshold
+                    else ("green" if comp.delta >= 0 else "yellow")
+                )
             d_sign = "+" if comp.cohen_d >= 0 else ""
             cohen_str = f"{d_sign}{comp.cohen_d:.2f}" if comp.n_items >= 2 else "n/a *"
             status_markup = _SEVERITY_MARKUP.get(comp.severity, comp.severity)
@@ -613,7 +641,7 @@ class ForgettingDetector:
                 mean_d = sum(deltas) / n
                 variance = sum((d - mean_d) ** 2 for d in deltas) / (n - 1)
                 std_d = variance**0.5
-                cohen_d = mean_d / std_d if std_d > 0.0 else 0.0
+                cohen_d = mean_d / std_d if std_d > 1e-10 else 0.0
             else:
                 cohen_d = 0.0
             comparisons.append(

@@ -96,13 +96,17 @@ class SkillSnapshot:
         return max(counts, key=lambda k: counts[k])
 
     # ── persistence ────────────────────────────────────────────────────────────
-    def save(self, directory: Path, privacy: bool = False) -> None:
+    def save(self, directory: Path, privacy: bool = False, passphrase: str | None = None) -> None:
         """Write snapshot metadata to ``directory/snapshot.json``.
 
         The file is always named ``snapshot.json`` inside *directory* —
         no subdirectory is created from the snapshot name.  Pass the
         snapshot's own directory (e.g. ``base / snapshot.name``) if you
         want the canonical on-disk layout used by :class:`RollbackManager`.
+
+        When *privacy* is ``True`` a *passphrase* must be supplied.  The key
+        is derived from the passphrase via PBKDF2-HMAC-SHA256; only the salt
+        (safe to store publicly) is written to disk — the key itself never is.
         """
         directory.mkdir(parents=True, exist_ok=True)
         if not privacy:
@@ -116,22 +120,19 @@ class SkillSnapshot:
                 "adapter_compression": self.adapter_compression,
             }
         else:
+            if not passphrase:
+                raise ValueError(
+                    "privacy=True requires a passphrase. "
+                    "Pass passphrase='your-secret' to snapshot.save()."
+                )
             from .encrypt import Encryptor
 
-            encryptor = Encryptor()
-
-            # Store encryption key in centralized ~/.pyrecall/keys/ directory
-            # Use SHA256 hash of absolute path to prevent filename collisions
-            key_dir = Path.home() / ".pyrecall" / "keys"
-            key_dir.mkdir(parents=True, exist_ok=True)
-            key_filename = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16] + ".key"
-            key_file = key_dir / key_filename
-            key_file.write_bytes(encryptor.key)
-            # Note: os.chmod with 0o600 does not strictly enforce file permissions on Windows systems.
-            os.chmod(key_file, 0o600)  # Read/write for owner only
+            encryptor = Encryptor.from_passphrase(passphrase)
+            import base64
 
             data = {
                 "encrypted": True,
+                "salt": base64.b64encode(encryptor.salt).decode(),
                 "name": encryptor.encrypt(self.name),
                 "model_name": encryptor.encrypt(self.model_name),
                 "created_at": encryptor.encrypt(self.created_at.isoformat()),
@@ -144,8 +145,15 @@ class SkillSnapshot:
         (directory / "snapshot.json").write_text(json.dumps(data, indent=2))
 
     @classmethod
-    def load(cls, directory: Path, privacy: bool = False) -> SkillSnapshot:
-        """Load a snapshot from *directory*/snapshot.json."""
+    def load(
+        cls, directory: Path, privacy: bool = False, passphrase: str | None = None
+    ) -> SkillSnapshot:
+        """Load a snapshot from *directory*/snapshot.json.
+
+        When *privacy* is ``True`` the same *passphrase* used during
+        :meth:`save` must be supplied so the key can be re-derived from the
+        stored salt.
+        """
         snapshot_file = directory / "snapshot.json"
         if not snapshot_file.exists():
             raise FileNotFoundError(
@@ -158,27 +166,29 @@ class SkillSnapshot:
             raise ValueError(
                 f"Snapshot file '{snapshot_file}' is corrupted (invalid JSON): {exc}"
             ) from exc
-        if data.get("encrypted", False) and not privacy:
+        is_encrypted = data.get("encrypted", False)
+        if is_encrypted and not privacy:
             raise ValueError(
                 f"Snapshot '{snapshot_file}' is encrypted but privacy=False was passed. "
-                "Load it with privacy=True and supply the key."
+                "Load it with privacy=True and supply the passphrase."
+            )
+        if privacy and not is_encrypted:
+            raise ValueError(
+                f"Snapshot '{snapshot_file}' is not encrypted but privacy=True was passed. "
+                "Load it with privacy=False."
             )
         if privacy:
+            if not passphrase:
+                raise ValueError(
+                    "privacy=True requires a passphrase. "
+                    "Pass the same passphrase used when saving the snapshot."
+                )
+            import base64
+
             from .encrypt import Encryptor
 
-            # Load encryption key from centralized ~/.pyrecall/keys/ directory
-            # Use SHA256 hash of absolute path to locate the key file
-            key_filename = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16] + ".key"
-            key_file = Path.home() / ".pyrecall" / "keys" / key_filename
-            if not key_file.exists():
-                raise FileNotFoundError(
-                    f"Decryption key not found at '{key_file}'. "
-                    f"The key for snapshot '{directory}' may have been deleted or moved."
-                )
-
-            key_bytes = key_file.read_bytes()
-            encryptor = Encryptor(key=key_bytes)
-
+            salt = base64.b64decode(data["salt"])
+            encryptor = Encryptor.from_passphrase(passphrase, salt=salt)
             return cls(
                 name=encryptor.decrypt(data["name"]),
                 model_name=encryptor.decrypt(data["model_name"]),

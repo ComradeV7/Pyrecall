@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sys
 import time
 from datetime import datetime, timedelta
@@ -391,12 +392,12 @@ def learn(
         ),
     ] = None,
     gradient_checkpointing: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--gradient-checkpointing",
+            "--gradient-checkpointing/--no-gradient-checkpointing",
             help="Enable gradient checkpointing to cut GPU memory ~40% at the cost of ~20% slower training.",
         ),
-    ] = False,
+    ] = None,
 ) -> None:
     """
     Fine-tune the model on a local dataset.
@@ -457,7 +458,7 @@ def learn(
             learning_rate=learning_rate,
             max_length=max_length,
             resume=resume,
-            gradient_checkpointing=gradient_checkpointing or None,
+            gradient_checkpointing=gradient_checkpointing,
         )
     except PyrecallError as exc:
         console.print(f"[red]Error:[/red] {exc}")
@@ -572,6 +573,10 @@ def snapshot(
 
 @app.command()
 def check(
+    ci: Annotated[
+        bool,
+        typer.Option("--ci", help="Machine-readable CI mode. Emits JSON and disables Rich output."),
+    ] = False,
     before: Annotated[
         str | None,
         typer.Option("--before", help="Snapshot name to use as baseline"),
@@ -656,7 +661,12 @@ def check(
 
         pyrecall check --watch --interval 30
     """
+    ts = ""
+    n = 0
     config = _read_config()
+    if ci:
+        json_output = True
+        verbose = False
     mgr = _build_rollback_manager(config)
 
     from pyrecall.detector import ForgettingDetector
@@ -665,9 +675,12 @@ def check(
         threshold if threshold is not None else config.get("forgetting_threshold", 0.10)
     )
     if not 0.0 < effective_threshold <= 1.0:
-        console.print(
-            f"[red]Error:[/red] threshold must be between 0 and 1, got {effective_threshold}."
-        )
+        if ci:
+            typer.echo(f"Error: threshold must be between 0 and 1, got {effective_threshold}.")
+        else:
+            console.print(
+                f"[red]Error:[/red] threshold must be between 0 and 1, got {effective_threshold}."
+            )
         raise typer.Exit(1)
     effective_cat_thresholds = {
         **config.get("category_thresholds", {}),
@@ -681,10 +694,16 @@ def check(
         """Run a single check pass. Returns 0 (healthy) or 2 (forgetting detected)."""
         all_snaps = mgr.list_snapshots()
         if len(all_snaps) < 2:
-            console.print(
-                "[red]Error:[/red] Need at least two snapshots to run a forgetting check.\n"
-                "Run [bold]pyrecall snapshot <name>[/bold] to create snapshots."
-            )
+            if ci:
+                typer.echo(
+                    "Error: Need at least two snapshots to run a forgetting check.\n"
+                    "Run pyrecall snapshot <name> to create snapshots."
+                )
+            else:
+                console.print(
+                    "[red]Error:[/red] Need at least two snapshots to run a forgetting check.\n"
+                    "Run [bold]pyrecall snapshot <name>[/bold] to create snapshots."
+                )
             return 1
 
         if before is None and after is None:
@@ -692,17 +711,28 @@ def check(
             snap_after = all_snaps[-1]
         else:
             if before is None or after is None:
-                console.print("[red]Error:[/red] Provide both --before and --after, or neither.")
+                if ci:
+                    typer.echo("Error: Provide both --before and --after, or neither.")
+                else:
+                    console.print(
+                        "[red]Error:[/red] Provide both --before and --after, or neither."
+                    )
                 return 1
             try:
                 snap_before = mgr.load_snapshot(before)
             except FileNotFoundError:
-                console.print(f"[red]Error:[/red] Snapshot '{before}' not found.")
+                if ci:
+                    typer.echo(f"Error: Snapshot '{before}' not found.")
+                else:
+                    console.print(f"[red]Error:[/red] Snapshot '{before}' not found.")
                 return 1
             try:
                 snap_after = mgr.load_snapshot(after)
             except FileNotFoundError:
-                console.print(f"[red]Error:[/red] Snapshot '{after}' not found.")
+                if ci:
+                    typer.echo(f"Error: Snapshot '{after}' not found.")
+                else:
+                    console.print(f"[red]Error:[/red] Snapshot '{after}' not found.")
                 return 1
 
         report = detector.compare(snap_before, snap_after)
@@ -715,9 +745,15 @@ def check(
         if output:
             try:
                 report.save(output)
-                console.print(f"[dim]Report saved to {output}[/dim]")
+                if ci:
+                    typer.echo(f"Report saved to {output}")
+                else:
+                    console.print(f"[dim]Report saved to {output}[/dim]")
             except ValueError as exc:
-                console.print(f"[red]Error:[/red] {exc}")
+                if ci:
+                    typer.echo(f"Error: {exc}")
+                else:
+                    console.print(f"[red]Error:[/red] {exc}")
                 return 1
 
         return 2 if report.degraded_skills else 0
@@ -727,12 +763,16 @@ def check(
 
     # ── watch mode ─────────────────────────────────────────────────────────────
     if interval < 1:
-        console.print("[red]Error:[/red] --interval must be at least 1 second.")
+        if ci:
+            typer.echo("Error: --interval must be at least 1 second.")
+        else:
+            console.print("[red]Error:[/red] --interval must be at least 1 second.")
         raise typer.Exit(1)
 
-    console.print(
-        f"[dim]Watching for snapshot changes every {interval}s. Press Ctrl-C to stop.[/dim]\n"
-    )
+    if ci:
+        typer.echo(f"{ts} Waiting for a second snapshot ({n}/2)")
+    else:
+        console.print(f"[dim][{ts}][/dim] Waiting for a second snapshot ({n}/2)…")
     last_mtime: float | None = None
     last_exit_code = 0
 
@@ -745,9 +785,12 @@ def check(
                     default=0.0,
                 )
             except OSError as exc:
-                console.print(
-                    f"[dim][yellow]watch: could not stat snapshot directory: {exc}[/yellow][/dim]"
-                )
+                if ci:
+                    typer.echo(f"watch: could not stat snapshot directory: {exc}")
+                else:
+                    console.print(
+                        f"[dim][yellow]watch: could not stat snapshot directory: {exc}[/yellow][/dim]"
+                    )
                 current_mtime = 0.0
 
             if current_mtime != last_mtime:
@@ -757,7 +800,10 @@ def check(
                 n = len(all_snaps)
 
                 if n < 2:
-                    console.print(f"[dim][{ts}][/dim] Waiting for a second snapshot ({n}/2)…")
+                    if ci:
+                        typer.echo(f"{ts} Waiting for a second snapshot ({n}/2)")
+                    else:
+                        console.print(f"[dim][{ts}][/dim] Waiting for a second snapshot ({n}/2)…")
                     last_exit_code = 0
                 else:
                     # Default to the last two; override if named snapshots were given.
@@ -769,9 +815,12 @@ def check(
                         try:
                             snap_b = mgr.load_snapshot(before)
                         except FileNotFoundError:
-                            console.print(
-                                f"[dim][{ts}][/dim] [red]Snapshot '{before}' not found.[/red]"
-                            )
+                            if ci:
+                                typer.echo(f"Snapshot '{before}' not found.")
+                            else:
+                                console.print(
+                                    f"[dim][{ts}][/dim] [red]Snapshot '{before}' not found.[/red]"
+                                )
                             last_exit_code = 1
                             _failed = True
 
@@ -779,9 +828,12 @@ def check(
                         try:
                             snap_a = mgr.load_snapshot(after)
                         except FileNotFoundError:
-                            console.print(
-                                f"[dim][{ts}][/dim] [red]Snapshot '{after}' not found.[/red]"
-                            )
+                            if ci:
+                                typer.echo(f"Snapshot '{after}' not found.")
+                            else:
+                                console.print(
+                                    f"[dim][{ts}][/dim] [red]Snapshot '{after}' not found.[/red]"
+                                )
                             last_exit_code = 1
                             _failed = True
 
@@ -795,20 +847,29 @@ def check(
                             f"{c} ({next((x.severity for x in report.comparisons if x.category == c), 'UNKNOWN')})"
                             for c in report.degraded_skills
                         )
-                        console.print(
-                            f"[dim][{ts}][/dim] [red]✗ DEGRADED[/red] — {snap_b.name} → {snap_a.name} | {cats}"
-                        )
+                        if ci:
+                            typer.echo(f"{ts} DEGRADED")
+                        else:
+                            console.print(
+                                f"[dim][{ts}][/dim] [red]✗ DEGRADED[/red] — {snap_b.name} → {snap_a.name} | {cats}"
+                            )
                         last_exit_code = 2
                     else:
-                        console.print(
-                            f"[dim][{ts}][/dim] [green]✓ healthy[/green] — {snap_b.name} → {snap_a.name} | {n} snapshots"
-                        )
+                        if ci:
+                            typer.echo(f"{ts} HEALTHY")
+                        else:
+                            console.print(
+                                f"[dim][{ts}][/dim] [green]✓ healthy[/green] — {snap_b.name} → {snap_a.name} | {n} snapshots"
+                            )
                         last_exit_code = 0
 
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        console.print("\n[dim]Watch stopped.[/dim]")
+        if ci:
+            typer.echo("Watch stopped.")
+        else:
+            console.print("\n[dim]Watch stopped.[/dim]")
 
     raise typer.Exit(last_exit_code)
 
@@ -848,6 +909,7 @@ def diff(
         str | None,
         typer.Option(
             "--output",
+            "--save-report",
             "-o",
             help="Save the report to a file. Format inferred from extension: .html, .md, or .json.",
         ),
@@ -1259,17 +1321,46 @@ def prune(
 
 
 @app.command()
-def status() -> None:
+def status(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output results as JSON instead of a rich table."),
+    ] = False,
+) -> None:
     """Show all saved snapshots and their per-category skill scores."""
     config = _read_config()
     mgr = _build_rollback_manager(config)
     all_snaps = mgr.list_snapshots()
 
     if not all_snaps:
-        console.print(
-            "[yellow]No snapshots found.[/yellow] "
-            "Run [bold]pyrecall snapshot <name>[/bold] to create one."
-        )
+        if json_output:
+            typer.echo(json.dumps({"model_name": config.get("model_name"), "snapshots": []}))
+        else:
+            console.print(
+                "[yellow]No snapshots found.[/yellow] "
+                "Run [bold]pyrecall snapshot <name>[/bold] to create one."
+            )
+        return
+
+    baseline = config.get("baseline_snapshot")
+
+    if json_output:
+        out = {
+            "model_name": config.get("model_name"),
+            "baseline_snapshot": baseline,
+            "snapshots": [
+                {
+                    "name": snap.name,
+                    "created_at": snap.created_at.isoformat(),
+                    "overall": snap.overall_score(),
+                    "scores": snap.category_scores(),
+                    "adapter_ok": bool(snap.adapter_path and snap.adapter_path.exists()),
+                    "is_baseline": snap.name == baseline,
+                }
+                for snap in all_snaps
+            ],
+        }
+        typer.echo(json.dumps(out, indent=2))
         return
 
     # Collect all category names from any snapshot for column headers.
@@ -1279,7 +1370,6 @@ def status() -> None:
             if cat not in all_categories:
                 all_categories.append(cat)
 
-    baseline = config.get("baseline_snapshot")
     table = Table(
         title=f"Snapshots — {config['model_name']}",
         show_lines=False,
@@ -1297,12 +1387,18 @@ def status() -> None:
         name_markup = f"[bold green]{snap.name} ★[/bold green]" if is_baseline else snap.name
         adapter_ok = "✓" if (snap.adapter_path and snap.adapter_path.exists()) else "✗"
 
+        overall = snap.overall_score()
+        overall_str = "-" if math.isnan(overall) else f"{overall:.3f}"
         row: list[str] = [
             name_markup,
             snap.created_at.strftime("%Y-%m-%d %H:%M"),
-            f"{snap.overall_score():.3f}",
+            overall_str,
         ]
-        row += [f"{cat_scores[cat]:.3f}" if cat in cat_scores else "-" for cat in all_categories]
+
+        def _fmt_score(v: float) -> str:
+            return "-" if math.isnan(v) else f"{v:.3f}"
+
+        row += [_fmt_score(cat_scores[cat]) if cat in cat_scores else "-" for cat in all_categories]
         row.append(adapter_ok)
         table.add_row(*row)
 
@@ -1726,11 +1822,9 @@ def benchmark_validate(
             )
 
     # ERROR: duplicate prompts within the suite
-    seen: set[str] = set()
-    for p in prompts:
-        if p in seen:
-            errors.append(f'Duplicate prompt: "{p[:60]}"')
-        seen.add(p)
+    for p, cnt in Counter(prompts).items():
+        if cnt > 1:
+            errors.append(f'Duplicate prompt ({cnt}×): "{p[:60]}"')
 
     # WARNING: any category with only 1 prompt (Cohen's d unavailable)
     cat_counts = Counter(cats)
@@ -1940,13 +2034,17 @@ def export(
         raise typer.Exit(1)
 
     if resolved_fmt == "json":
+
+        def _safe_round(v: float, n: int) -> float | None:
+            return None if math.isnan(v) else round(v, n)
+
         records = [
             {
                 "name": snap.name,
                 "created_at": snap.created_at.isoformat(),
-                "overall": round(snap.overall_score(), 4),
+                "overall": _safe_round(snap.overall_score(), 4),
                 "categories": {
-                    cat: round(score, 4) for cat, score in snap.category_scores().items()
+                    cat: _safe_round(score, 4) for cat, score in snap.category_scores().items()
                 },
             }
             for snap in all_snaps
@@ -1971,13 +2069,15 @@ def export(
         rows = []
         for snap in all_snaps:
             cat_scores = snap.category_scores()
+            overall = snap.overall_score()
             row: dict = {
                 "snapshot": snap.name,
                 "created_at": snap.created_at.isoformat(),
-                "overall": round(snap.overall_score(), 4),
+                "overall": "" if math.isnan(overall) else round(overall, 4),
             }
             for cat in all_categories:
-                row[cat] = round(cat_scores[cat], 4) if cat in cat_scores else ""
+                v = cat_scores.get(cat)
+                row[cat] = "" if v is None or math.isnan(v) else round(v, 4)
             rows.append(row)
 
         if output:

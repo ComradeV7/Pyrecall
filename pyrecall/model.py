@@ -214,6 +214,16 @@ class Model:
                 Sync and async callables are both supported. Exceptions are caught and
                 surfaced as warnings so they never crash the training run.
             on_healthy: Same as *on_forgetting* but invoked when no forgetting is detected.
+            category_thresholds: Per-category forgetting thresholds, e.g.
+                ``{"safety": 0.03, "coding": 0.12}``. Overrides *forgetting_threshold*
+                for the specified categories; unspecified categories use the global value.
+            scoring_method: Benchmark scoring method — ``"log_likelihood"`` (default,
+                recommended) or ``"cosine"`` (legacy).
+            snapshot_compression: Compress saved adapter weights: ``"none"`` (default),
+                ``"gzip"``, ``"zstd"`` (requires ``pip install zstandard``), or
+                ``"lz4"`` (requires ``pip install lz4``).
+            gradient_checkpointing: Enable gradient checkpointing during training to
+                reduce GPU memory usage by ~40 % at the cost of ~20 % slower training.
         """
         if strategy not in ("lora", "qlora"):
             raise PyrecallError(
@@ -249,15 +259,31 @@ class Model:
         )
         self._snapshot_compression = snapshot_compression
         self._gradient_checkpointing = gradient_checkpointing
+        # Replay buffer lives under ~/.pyrecall/replay/ by default.
+        # When snapshot_dir is overridden (e.g. in tests), put replay alongside it
+        # so tests stay isolated, but keep it separate from the snapshots tree.
+        replay_base = snapshot_dir.parent / "replay" if snapshot_dir is not None else None
         self.replay_buffer: ReplayBuffer | None = (
-            ReplayBuffer(model_name=model_name, max_size=replay_buffer_size, base_dir=snapshot_dir)
+            ReplayBuffer(model_name=model_name, max_size=replay_buffer_size, base_dir=replay_base)
             if replay_buffer_size > 0
             else None
         )
 
         console.print(f"[info]Loading {model_name} on {self.device}…[/info]")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        except OSError as exc:
+            msg = str(exc)
+            if "401" in msg or "gated" in msg.lower() or "access" in msg.lower():
+                raise PyrecallError(
+                    f"Access to '{model_name}' is restricted on Hugging Face.\n\n"
+                    "To fix this:\n"
+                    "  1. Accept the model license at https://huggingface.co/" + model_name + "\n"
+                    "  2. Log in:  huggingface-cli login\n"
+                    "     or set:  export HF_TOKEN=<your_token>"
+                ) from exc
+            raise
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -271,6 +297,13 @@ class Model:
         if load_in_4bit or load_in_8bit:
             if load_in_4bit and load_in_8bit:
                 raise PyrecallError("Cannot use load_in_4bit and load_in_8bit together.")
+            try:
+                from bitsandbytes import __version__  # noqa: F401
+            except ImportError as exc:
+                raise PyrecallError(
+                    "4-bit/8-bit quantization requires bitsandbytes. "
+                    "Install it with: pip install pyrecall[quantization]"
+                ) from exc
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=load_in_4bit,
                 load_in_8bit=load_in_8bit,
@@ -280,12 +313,24 @@ class Model:
             )
 
         dtype = torch.float16 if self.device != "cpu" else torch.float32
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            quantization_config=bnb_config,
-            device_map="auto" if bnb_config else None,
-        )
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=dtype,
+                quantization_config=bnb_config,
+                device_map="auto" if bnb_config else None,
+            )
+        except OSError as exc:
+            msg = str(exc)
+            if "401" in msg or "gated" in msg.lower() or "access" in msg.lower():
+                raise PyrecallError(
+                    f"Access to '{model_name}' is restricted on Hugging Face.\n\n"
+                    "To fix this:\n"
+                    "  1. Accept the model license at https://huggingface.co/" + model_name + "\n"
+                    "  2. Log in:  huggingface-cli login\n"
+                    "     or set:  export HF_TOKEN=<your_token>"
+                ) from exc
+            raise
 
         if bnb_config:
             base = prepare_model_for_kbit_training(base)
@@ -578,7 +623,8 @@ class Model:
         resume_from = None
         if resume:
             checkpoints = sorted(
-                run_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1])
+                (p for p in run_dir.glob("checkpoint-*") if p.name.split("-")[-1].isdigit()),
+                key=lambda p: int(p.name.split("-")[-1]),
             )
             if checkpoints:
                 resume_from = str(checkpoints[-1])
@@ -712,7 +758,7 @@ class Model:
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         base_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map=None if self.device != "cuda" else "auto",
         )
         with decompressed_adapter(snap.adapter_path, snap.adapter_compression) as adapter_dir:

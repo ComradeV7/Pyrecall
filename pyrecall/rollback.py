@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import fcntl
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from filelock import FileLock
 
 from .snapshot import SkillSnapshot
 from .utils import get_logger, safe_model_name
@@ -19,15 +20,25 @@ logger = get_logger(__name__)
 
 @contextmanager
 def _snap_lock(snap_dir: Path):
-    """Acquire an exclusive filesystem lock for the duration of a snapshot save."""
-    lock_file = snap_dir / ".save.lock"
+    """Acquire an exclusive filesystem lock for a snapshot directory.
+
+    The lock file is placed alongside the snap directory (not inside it) so
+    that shutil.rmtree on snap_dir never tries to delete a held lock file,
+    which would raise PermissionError on Windows.
+    """
+    lock_file = snap_dir.parent / f".{snap_dir.name}.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
-    with lock_file.open("w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with FileLock(str(lock_file)):
+        yield
+
+
+def _validate_snapshot_name(name: str) -> None:
+    """Raise ValueError if *name* contains path separators or traversal segments."""
+    if not name or name == "." or "/" in name or "\\" in name or ".." in name:
+        raise ValueError(
+            f"Invalid snapshot name '{name}'. "
+            "Names must not be '.', contain path separators, or '..' segments."
+        )
 
 
 class RollbackManager:
@@ -79,6 +90,7 @@ class RollbackManager:
         """
         from .compress import compress_adapter_dir
 
+        _validate_snapshot_name(snapshot.name)
         snap_dir = self.base_dir / snapshot.name
         snap_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,12 +129,14 @@ class RollbackManager:
 
         Raises a descriptive error if the snapshot does not exist.
         """
+        _validate_snapshot_name(name)
         snap_dir = self.base_dir / name
         if not snap_dir.exists():
             available = self._available_names()
             hint = f" Available snapshots: {available}" if available else " No snapshots saved yet."
             raise FileNotFoundError(f"Snapshot '{name}' not found under '{self.base_dir}'.{hint}")
-        return SkillSnapshot.load(snap_dir)
+        with _snap_lock(snap_dir):
+            return SkillSnapshot.load(snap_dir)
 
     def list_snapshots(self) -> list[SkillSnapshot]:
         """Return all saved snapshots sorted by creation time (oldest first).
@@ -136,7 +150,8 @@ class RollbackManager:
         for snap_dir in sorted(self.base_dir.iterdir()):
             if snap_dir.is_dir() and (snap_dir / "snapshot.json").exists():
                 try:
-                    snapshots.append(SkillSnapshot.load(snap_dir))
+                    with _snap_lock(snap_dir):
+                        snapshots.append(SkillSnapshot.load(snap_dir))
                 except Exception as exc:
                     logger.warning("Could not load snapshot at %s: %s", snap_dir, exc)
         return sorted(snapshots, key=lambda s: s.created_at)
@@ -147,14 +162,20 @@ class RollbackManager:
 
     def delete_snapshot(self, name: str) -> None:
         """Permanently delete a snapshot and its adapter weights."""
+        _validate_snapshot_name(name)
         snap_dir = self.base_dir / name
         if not snap_dir.exists():
             raise FileNotFoundError(f"Cannot delete: snapshot '{name}' not found.")
-        shutil.rmtree(snap_dir)
+        with _snap_lock(snap_dir):
+            shutil.rmtree(snap_dir)
         logger.debug("Deleted snapshot '%s'", name)
 
     def has_snapshot(self, name: str) -> bool:
         """Return True if *name* refers to a saved snapshot."""
+        try:
+            _validate_snapshot_name(name)
+        except ValueError:
+            return False
         return (self.base_dir / name / "snapshot.json").exists()
 
     # ── private ────────────────────────────────────────────────────────────────

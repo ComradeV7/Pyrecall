@@ -429,9 +429,14 @@ class TestLearnDataFormats:
 
 class TestQLoRA:
     def test_qlora_strategy_accepted(self, tmp_snapshot_dir: Path) -> None:
+        import sys
+        import types
+
         mock_tok = _make_mock_tokenizer()
         mock_base = _make_mock_base_model()
         mock_peft = _make_mock_peft_model()
+        fake_bnb = types.ModuleType("bitsandbytes")
+        fake_bnb.__version__ = "0.41.0"
 
         with (
             patch("pyrecall.model.AutoTokenizer.from_pretrained", return_value=mock_tok),
@@ -439,6 +444,7 @@ class TestQLoRA:
             patch("pyrecall.model.get_peft_model", return_value=mock_peft),
             patch("pyrecall.model.prepare_model_for_kbit_training", return_value=mock_base),
             patch("pyrecall.model.BitsAndBytesConfig") as mock_bnb,
+            patch.dict(sys.modules, {"bitsandbytes": fake_bnb}),
         ):
             from pyrecall.model import Model
 
@@ -474,9 +480,14 @@ class TestQLoRA:
 
     def test_qlora_strategy_alone_enables_4bit(self, tmp_snapshot_dir: Path) -> None:
         """strategy='qlora' with no explicit bit flags must default to load_in_4bit=True."""
+        import sys
+        import types
+
         mock_tok = _make_mock_tokenizer()
         mock_base = _make_mock_base_model()
         mock_peft = _make_mock_peft_model()
+        fake_bnb = types.ModuleType("bitsandbytes")
+        fake_bnb.__version__ = "0.41.0"
 
         with (
             patch("pyrecall.model.AutoTokenizer.from_pretrained", return_value=mock_tok),
@@ -484,6 +495,7 @@ class TestQLoRA:
             patch("pyrecall.model.get_peft_model", return_value=mock_peft),
             patch("pyrecall.model.prepare_model_for_kbit_training", return_value=mock_base),
             patch("pyrecall.model.BitsAndBytesConfig") as mock_bnb,
+            patch.dict(sys.modules, {"bitsandbytes": fake_bnb}),
         ):
             from pyrecall.model import Model
 
@@ -496,9 +508,14 @@ class TestQLoRA:
 
     def test_qlora_strategy_with_8bit_uses_8bit(self, tmp_snapshot_dir: Path) -> None:
         """strategy='qlora' + load_in_8bit=True should not override to 4-bit."""
+        import sys
+        import types
+
         mock_tok = _make_mock_tokenizer()
         mock_base = _make_mock_base_model()
         mock_peft = _make_mock_peft_model()
+        fake_bnb = types.ModuleType("bitsandbytes")
+        fake_bnb.__version__ = "0.41.0"
 
         with (
             patch("pyrecall.model.AutoTokenizer.from_pretrained", return_value=mock_tok),
@@ -506,6 +523,7 @@ class TestQLoRA:
             patch("pyrecall.model.get_peft_model", return_value=mock_peft),
             patch("pyrecall.model.prepare_model_for_kbit_training", return_value=mock_base),
             patch("pyrecall.model.BitsAndBytesConfig") as mock_bnb,
+            patch.dict(sys.modules, {"bitsandbytes": fake_bnb}),
         ):
             from pyrecall.model import Model
 
@@ -608,6 +626,38 @@ class TestResumeTraining:
             patched_model.learn(str(data_file), epochs=1, resume=False)
             call_kwargs = mock_trainer.train.call_args
             assert call_kwargs.kwargs.get("resume_from_checkpoint") is None
+
+    def test_resume_skips_non_numeric_checkpoint_dirs(self, patched_model, tmp_path: Path) -> None:
+        data_file = tmp_path / "train.jsonl"
+        data_file.write_text(json.dumps({"text": "hi"}) + "\n")
+
+        run_dir = Path.home() / ".pyrecall" / "runs" / "test--model"
+        good_checkpoint = run_dir / "checkpoint-20"
+        bad_checkpoint = run_dir / "checkpoint-final"
+        good_checkpoint.mkdir(parents=True, exist_ok=True)
+        bad_checkpoint.mkdir(parents=True, exist_ok=True)
+
+        mock_trainer = MagicMock()
+        try:
+            with (
+                patch("pyrecall.model.load_dataset") as mock_ds,
+                patch("pyrecall.model.Trainer", return_value=mock_trainer),
+                patch("pyrecall.model.TrainingArguments"),
+                patch("pyrecall.model.DataCollatorForLanguageModeling"),
+            ):
+                mock_dataset = MagicMock()
+                mock_dataset.column_names = ["text"]
+                mock_dataset.__len__.return_value = 1
+                mock_dataset.map.return_value = mock_dataset
+                mock_ds.return_value = mock_dataset
+
+                # Should not raise even though checkpoint-final exists.
+                patched_model.learn(str(data_file), epochs=1, resume=True)
+                call_kwargs = mock_trainer.train.call_args
+                assert call_kwargs.kwargs.get("resume_from_checkpoint") == str(good_checkpoint)
+        finally:
+            good_checkpoint.rmdir()
+            bad_checkpoint.rmdir()
 
 
 class TestLoraTargets:

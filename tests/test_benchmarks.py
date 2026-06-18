@@ -92,6 +92,20 @@ class TestCustomBenchmarkManagerAdd:
         with pytest.raises(ValueError):
             mgr.add(src)
 
+    def test_add_rejects_path_traversal_name(self, tmp_path: Path) -> None:
+        src = tmp_path / "suite.jsonl"
+        _write_jsonl(src, [_valid_entry()])
+        mgr = CustomBenchmarkManager(base_dir=tmp_path / "store")
+        with pytest.raises(ValueError):
+            mgr.add(src, name="../../evil")
+
+    def test_add_rejects_dot_name(self, tmp_path: Path) -> None:
+        src = tmp_path / "suite.jsonl"
+        _write_jsonl(src, [_valid_entry()])
+        mgr = CustomBenchmarkManager(base_dir=tmp_path / "store")
+        with pytest.raises(ValueError):
+            mgr.add(src, name=".")
+
 
 class TestCustomBenchmarkManagerList:
     def test_list_empty_when_no_suites(self, tmp_path: Path) -> None:
@@ -134,6 +148,11 @@ class TestCustomBenchmarkManagerRemove:
         mgr = CustomBenchmarkManager(base_dir=tmp_path / "store")
         with pytest.raises(FileNotFoundError):
             mgr.remove("missing")
+
+    def test_remove_rejects_path_traversal(self, tmp_path: Path) -> None:
+        mgr = CustomBenchmarkManager(base_dir=tmp_path / "store")
+        with pytest.raises(ValueError):
+            mgr.remove("../../etc/passwd")
 
 
 class TestCustomBenchmarkManagerLoadAll:
@@ -378,6 +397,20 @@ class TestBenchmarkValidateCli:
             result = runner.invoke(app, ["benchmark", "validate", "dup"])
         assert result.exit_code == 1
         assert "duplicate" in result.output.lower()
+
+    def test_triple_duplicate_reported_once(self, tmp_path: Path) -> None:
+        # A prompt appearing 3 times should produce exactly one "duplicate" error,
+        # not one per extra occurrence.
+        entries = [
+            {"prompt": _LONG_PROMPT, "reference_answer": _LONG_REF, "category": "x"},
+            {"prompt": _LONG_PROMPT, "reference_answer": "Answer B.", "category": "x"},
+            {"prompt": _LONG_PROMPT, "reference_answer": "Answer C.", "category": "x"},
+        ]
+        mgr = _make_store(tmp_path, "dup3", entries)
+        with patch("pyrecall.benchmarks.custom.CustomBenchmarkManager", return_value=mgr):
+            result = runner.invoke(app, ["benchmark", "validate", "dup3"])
+        assert result.exit_code == 1
+        assert result.output.lower().count("duplicate") == 1
 
     def test_single_item_category_is_warning_not_error(self, tmp_path: Path) -> None:
         entries = [

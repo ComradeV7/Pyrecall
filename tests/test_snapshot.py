@@ -204,9 +204,9 @@ class TestSkillSnapshotPrivacy:
         except ImportError:
             pytest.skip("cryptography not installed")
 
-    def test_privacy_save_creates_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    _PW = "test-passphrase"
+
+    def test_privacy_save_creates_file(self, tmp_path: Path) -> None:
         self._requires_cryptography()
         # Mock Path.home() to use tmp_path
         fake_home = tmp_path / "fake_home"
@@ -214,7 +214,7 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot()
-        snap.save(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert (tmp_path / "v1" / "snapshot.json").exists()
 
     def test_privacy_save_sets_encrypted_true(
@@ -226,22 +226,22 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot()
-        snap.save(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["encrypted"] is True
 
-    def test_privacy_save_does_not_store_key_in_json(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_privacy_save_stores_salt_not_key(self, tmp_path: Path) -> None:
         self._requires_cryptography()
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot()
-        snap.save(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert "key" not in data
+        assert "salt" in data
+        assert len(data["salt"]) > 0
 
     def test_privacy_save_creates_key_file_in_home_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -291,7 +291,7 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot(name="secret-snap")
-        snap.save(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
         data = json.loads((tmp_path / "v1" / "snapshot.json").read_text())
         assert data["name"] != "secret-snap"
 
@@ -304,8 +304,8 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot(name="secret-snap")
-        snap.save(tmp_path / "v1", privacy=True)
-        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert loaded.name == "secret-snap"
 
     def test_privacy_round_trip_model_name(
@@ -317,8 +317,8 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot(model_name="org/private-model")
-        snap.save(tmp_path / "v1", privacy=True)
-        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert loaded.model_name == "org/private-model"
 
     def test_privacy_round_trip_scores(
@@ -330,8 +330,8 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot(n_scores=3)
-        snap.save(tmp_path / "v1", privacy=True)
-        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert len(loaded.scores) == 3
         assert loaded.scores[0].score == pytest.approx(snap.scores[0].score)
 
@@ -344,8 +344,8 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot()
-        snap.save(tmp_path / "v1", privacy=True)
-        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert loaded.created_at == _DT
 
     def test_privacy_round_trip_sets_encrypted_flag(
@@ -357,30 +357,29 @@ class TestSkillSnapshotPrivacy:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
 
         snap = _make_snapshot()
-        snap.save(tmp_path / "v1", privacy=True)
-        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        loaded = SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase=self._PW)
         assert loaded.encrypted is True
 
-    def test_privacy_load_raises_when_key_file_missing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_privacy_wrong_passphrase_raises(self, tmp_path: Path) -> None:
         self._requires_cryptography()
-        fake_home = tmp_path / "fake_home"
-        fake_home.mkdir()
-        monkeypatch.setattr(Path, "home", lambda: fake_home)
-
         snap = _make_snapshot()
-        snapshot_dir = tmp_path / "v1"
-        snap.save(snapshot_dir, privacy=True)
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        with pytest.raises(ValueError, match="decrypt"):
+            SkillSnapshot.load(tmp_path / "v1", privacy=True, passphrase="wrong-passphrase")
 
-        # Delete the key file
-        key_filename = _get_key_filename(snapshot_dir)
-        key_file = fake_home / ".pyrecall" / "keys" / key_filename
-        key_file.unlink()
+    def test_privacy_missing_passphrase_on_save_raises(self, tmp_path: Path) -> None:
+        self._requires_cryptography()
+        snap = _make_snapshot()
+        with pytest.raises(ValueError, match="passphrase"):
+            snap.save(tmp_path / "v1", privacy=True)
 
-        # Attempt to load should raise FileNotFoundError
-        with pytest.raises(FileNotFoundError, match="Decryption key not found"):
-            SkillSnapshot.load(snapshot_dir, privacy=True)
+    def test_privacy_missing_passphrase_on_load_raises(self, tmp_path: Path) -> None:
+        self._requires_cryptography()
+        snap = _make_snapshot()
+        snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
+        with pytest.raises(ValueError, match="passphrase"):
+            SkillSnapshot.load(tmp_path / "v1", privacy=True)
 
     def test_privacy_save_without_cryptography_raises(self, tmp_path: Path) -> None:
         with patch.dict(
@@ -388,7 +387,7 @@ class TestSkillSnapshotPrivacy:
         ):
             snap = _make_snapshot()
             with pytest.raises(ImportError, match="privacy"):
-                snap.save(tmp_path / "v1", privacy=True)
+                snap.save(tmp_path / "v1", privacy=True, passphrase=self._PW)
 
 
 # ── Encryptor ──────────────────────────────────────────────────────────────────
@@ -405,7 +404,7 @@ class TestEncryptor:
         self._requires_cryptography()
         from pyrecall.encrypt import Encryptor
 
-        enc = Encryptor()
+        enc = Encryptor.from_passphrase("my-pass")
         original = "hello world"
         assert enc.decrypt(enc.encrypt(original)) == original
 
@@ -413,23 +412,23 @@ class TestEncryptor:
         self._requires_cryptography()
         from pyrecall.encrypt import Encryptor
 
-        enc = Encryptor()
+        enc = Encryptor.from_passphrase("my-pass")
         assert enc.encrypt("secret") != "secret"
 
-    def test_same_key_can_decrypt(self) -> None:
+    def test_same_passphrase_and_salt_can_decrypt(self) -> None:
         self._requires_cryptography()
         from pyrecall.encrypt import Encryptor
 
-        enc1 = Encryptor()
+        enc1 = Encryptor.from_passphrase("my-pass")
         ciphertext = enc1.encrypt("data")
-        enc2 = Encryptor(key=enc1.key)
+        enc2 = Encryptor.from_passphrase("my-pass", salt=enc1.salt)
         assert enc2.decrypt(ciphertext) == "data"
 
     def test_key_is_bytes(self) -> None:
         self._requires_cryptography()
         from pyrecall.encrypt import Encryptor
 
-        enc = Encryptor()
+        enc = Encryptor.from_passphrase("my-pass")
         assert isinstance(enc.key, bytes)
 
     def test_missing_cryptography_raises_import_error(self) -> None:
@@ -442,7 +441,7 @@ class TestEncryptor:
 
             importlib.reload(enc_mod)
             with pytest.raises(ImportError, match="privacy"):
-                enc_mod.Encryptor()
+                enc_mod.Encryptor.from_passphrase("my-pass")
 
 
 class TestOverallScoreCategoryBalanced:
@@ -486,15 +485,15 @@ class TestEncryptedSnapshotAdapterCompression:
         pytest.importorskip("cryptography")
         snap = _make_snapshot()
         snap.adapter_compression = "zstd"
-        snap.save(tmp_path, privacy=True)
-        loaded = SkillSnapshot.load(tmp_path, privacy=True)
+        snap.save(tmp_path, privacy=True, passphrase="pw")
+        loaded = SkillSnapshot.load(tmp_path, privacy=True, passphrase="pw")
         assert loaded.adapter_compression == "zstd"
 
     def test_save_and_load_none_compression_still_works(self, tmp_path: Path) -> None:
         pytest.importorskip("cryptography")
         snap = _make_snapshot()
-        snap.save(tmp_path, privacy=True)
-        loaded = SkillSnapshot.load(tmp_path, privacy=True)
+        snap.save(tmp_path, privacy=True, passphrase="pw")
+        loaded = SkillSnapshot.load(tmp_path, privacy=True, passphrase="pw")
         assert loaded.adapter_compression == "none"
 
 
@@ -506,7 +505,7 @@ class TestLoadEncryptedWithoutPrivacyFlag:
     ) -> None:
         pytest.importorskip("cryptography")
         snap = _make_snapshot()
-        snap.save(tmp_path, privacy=True)
+        snap.save(tmp_path, privacy=True, passphrase="pw")
         with pytest.raises(ValueError, match="encrypted"):
             SkillSnapshot.load(tmp_path, privacy=False)
 
