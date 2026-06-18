@@ -214,6 +214,16 @@ class Model:
                 Sync and async callables are both supported. Exceptions are caught and
                 surfaced as warnings so they never crash the training run.
             on_healthy: Same as *on_forgetting* but invoked when no forgetting is detected.
+            category_thresholds: Per-category forgetting thresholds, e.g.
+                ``{"safety": 0.03, "coding": 0.12}``. Overrides *forgetting_threshold*
+                for the specified categories; unspecified categories use the global value.
+            scoring_method: Benchmark scoring method — ``"log_likelihood"`` (default,
+                recommended) or ``"cosine"`` (legacy).
+            snapshot_compression: Compress saved adapter weights: ``"none"`` (default),
+                ``"gzip"``, ``"zstd"`` (requires ``pip install zstandard``), or
+                ``"lz4"`` (requires ``pip install lz4``).
+            gradient_checkpointing: Enable gradient checkpointing during training to
+                reduce GPU memory usage by ~40 % at the cost of ~20 % slower training.
         """
         if strategy not in ("lora", "qlora"):
             raise PyrecallError(
